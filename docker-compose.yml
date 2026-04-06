@@ -1,0 +1,23 @@
+# docker-compose.yml
+
+services:
+  qdrant:
+    image: qdrant/qdrant
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  api:
+    build: .
+    container_name: linage2-api
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    depends_on:
+      - qdrant
+
+volumes:
+  qdrant_data:
