@@ -121,14 +121,14 @@ def search_patient_biomarkers(
             ]
         )
 
-    results = client.search(
+    results = client.query_points(
         collection_name=PATIENT_COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=search_filter,
         limit=limit
     )
 
-    return [hit.payload for hit in results]
+    return [hit.payload for hit in results.points]
 
 
 def search_pc_knowledge(
@@ -151,14 +151,14 @@ def search_pc_knowledge(
             ]
         )
 
-    results = client.search(
+    results = client.query_points(
         collection_name=PC_COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=search_filter,
         limit=limit
     )
 
-    return [hit.payload for hit in results]
+    return [hit.payload for hit in results.points]
 
 
 # ── Patients List ──────────────────────────────────────────────────────────────
