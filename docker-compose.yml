@@ -1,9 +1,9 @@
 # docker-compose.yml
 
 services:
-  qdrant:
+  qdrant-alis:
     image: qdrant/qdrant
-    container_name: qdrant
+    container_name: qdrant-alis
     ports:
       - "6333:6333"
     volumes:
@@ -17,7 +17,7 @@ services:
     env_file:
       - .env
     depends_on:
-      - qdrant
+      - qdrant-alis
 
 volumes:
   qdrant_data:
