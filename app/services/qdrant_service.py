@@ -1,84 +1,86 @@
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue
-)
-from dotenv import load_dotenv
 import os
 import uuid
+import logging
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue
+)
 
 load_dotenv()
 
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
-PATIENT_COLLECTION = os.getenv("PATIENT_COLLECTION", "patient_biomarkers")
+logger = logging.getLogger(__name__)
+
+QDRANT_URL = os.getenv("QDRANT_HOST", "http://localhost:6333")
+PATIENT_COLLECTION = os.getenv("PATIENT_COLLECTION", "patient_data")
 PC_COLLECTION = os.getenv("PC_COLLECTION", "pc_knowledge")
+VECTOR_SIZE = 768
 
-VECTOR_SIZE = 768  # nomic-embed-text output size
+logger.info(f"Connecting to Qdrant at {QDRANT_URL}")
+client = QdrantClient(url=QDRANT_URL)
 
-client = QdrantClient(url=QDRANT_HOST, port=QDRANT_PORT)
-
-
-# ── Collection Setup ───────────────────────────────────────────────────────────
 
 def init_collections():
-    """
-    Creates collections if they don't exist yet.
-    Call this once on startup.
-    """
+    logger.info("Initializing Qdrant collections")
     existing = [c.name for c in client.get_collections().collections]
 
     if PATIENT_COLLECTION not in existing:
         client.create_collection(
             collection_name=PATIENT_COLLECTION,
-            vectors_config=VectorParams(
-                size=VECTOR_SIZE,
-                distance=Distance.COSINE
-            )
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
         )
-        print(f"Created collection: {PATIENT_COLLECTION}")
+        logger.info(f"Created collection: {PATIENT_COLLECTION}")
+    else:
+        logger.info(f"Collection already exists: {PATIENT_COLLECTION}")
 
     if PC_COLLECTION not in existing:
         client.create_collection(
             collection_name=PC_COLLECTION,
-            vectors_config=VectorParams(
-                size=VECTOR_SIZE,
-                distance=Distance.COSINE
-            )
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
         )
-        print(f"Created collection: {PC_COLLECTION}")
+        logger.info(f"Created collection: {PC_COLLECTION}")
+    else:
+        logger.info(f"Collection already exists: {PC_COLLECTION}")
 
 
-# ── Upsert ─────────────────────────────────────────────────────────────────────
-def upsert_patient_chunks(chunks: list[dict], vectors: list[list[float]]):
-    points = []
-    for chunk, vector in zip(chunks, vectors):
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
+def upsert_patient(patient_uuid: str, text_summary: str, vector: list[float], payload: dict):
+    logger.info(f"Upserting patient {patient_uuid} into Qdrant")
+    client.upsert(
+        collection_name=PATIENT_COLLECTION,
+        points=[PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, patient_uuid)),
             vector=vector,
-            payload={
-                "patient_id": chunk["patient_id"],
-                "param_code": chunk["param_code"],
-                "param_name": chunk["param_name"],
-                "reference_range": chunk.get("reference_range", ""),
-                "readings": chunk.get("readings", {}),
-                "pc_group": chunk.get("pc_group", ""),
-                "text_summary": chunk.get("text_summary", "")
-            }
-        ))
-    client.upsert(collection_name=PATIENT_COLLECTION, points=points)
-    print(f"Upserted {len(points)} patient chunks")
-    
+            payload={"patient_id": patient_uuid, **payload}
+        )]
+    )
+    logger.info(f"Patient {patient_uuid} upserted successfully")
+
+
+def search_patient(patient_uuid: str, query_vector: list[float]) -> dict | None:
+    logger.info(f"Searching Qdrant for patient {patient_uuid}")
+    results = client.search(
+        collection_name=PATIENT_COLLECTION,
+        query_vector=query_vector,
+        query_filter=Filter(
+            must=[FieldCondition(
+                key="patient_id",
+                match=MatchValue(value=patient_uuid)
+            )]
+        ),
+        limit=1,
+        with_payload=True
+    )
+    if results:
+        logger.info(f"Patient {patient_uuid} found in Qdrant")
+        return results[0].payload
+    logger.info(f"Patient {patient_uuid} not found in Qdrant")
+    return None
+
 
 def upsert_pc_chunks(chunks: list[dict], vectors: list[list[float]]):
-    """
-    Upserts PC knowledge chunks from the PDF into Qdrant.
-    """
+    logger.info(f"Upserting {len(chunks)} PC knowledge chunks")
     points = []
     for chunk, vector in zip(chunks, vectors):
         points.append(PointStruct(
@@ -94,104 +96,49 @@ def upsert_pc_chunks(chunks: list[dict], vectors: list[list[float]]):
                 "raw_text": chunk.get("raw_text", "")
             }
         ))
-
     client.upsert(collection_name=PC_COLLECTION, points=points)
-    print(f"Upserted {len(points)} PC knowledge chunks")
+    logger.info(f"Upserted {len(points)} PC knowledge chunks successfully")
 
 
-# ── Search ─────────────────────────────────────────────────────────────────────
-
-def search_patient_biomarkers(
-    query_vector: list[float],
-    patient_id: str = None,
-    limit: int = 5
-) -> list[dict]:
-    """
-    Semantic search in patient_biomarkers.
-    Optionally filter by patient_id.
-    """
-    search_filter = None
-    if patient_id:
-        search_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="patient_id",
-                    match=MatchValue(value=patient_id)
-                )
-            ]
-        )
-
-    results = client.query_points(
-        collection_name=PATIENT_COLLECTION,
-        query=query_vector,
-        query_filter=search_filter,
-        limit=limit,
-        with_payload=True
-
-    )
-
-    return [hit.payload for hit in results.points]
-
-
-def search_pc_knowledge(
-    query_vector: list[float],
-    pc_group: str = None,
-    limit: int = 3
-) -> list[dict]:
-    """
-    Semantic search in pc_knowledge.
-    Optionally filter by pc_group.
-    """
+def search_pc_knowledge(query_vector: list[float], pc_group: str = None, limit: int = 3) -> list[dict]:
+    logger.info(f"Searching PC knowledge | pc_group filter: {pc_group}")
     search_filter = None
     if pc_group:
         search_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="pc_group",
-                    match=MatchValue(value=pc_group.upper())
-                )
-            ]
+            must=[FieldCondition(key="pc_group", match=MatchValue(value=pc_group.upper()))]
         )
-
-    results = client.query_points(
+    results = client.search(
         collection_name=PC_COLLECTION,
-        query=query_vector,
+        query_vector=query_vector,
         query_filter=search_filter,
         limit=limit,
         with_payload=True
-
     )
+    logger.info(f"PC knowledge search returned {len(results)} results")
+    return [hit.payload for hit in results]
 
-    return [hit.payload for hit in results.points]
-
-
-# ── Patients List ──────────────────────────────────────────────────────────────
 
 def list_patients() -> list[str]:
-    """
-    Scrolls through patient_biomarkers and returns unique patient IDs.
-    """
+    logger.info("Listing all patients from Qdrant")
     results, _ = client.scroll(
         collection_name=PATIENT_COLLECTION,
         limit=1000,
         with_payload=True
     )
-
-    patient_ids = list(set(
+    patients = sorted(set(
         hit.payload["patient_id"]
         for hit in results
         if "patient_id" in hit.payload
     ))
+    logger.info(f"Found {len(patients)} patients")
+    return patients
 
-    return sorted(patient_ids)
-
-
-# ── Health ─────────────────────────────────────────────────────────────────────
 
 def check_qdrant_health() -> str:
     try:
         client.get_collections()
+        logger.info("Qdrant health check passed")
         return "ok"
     except Exception as e:
+        logger.error(f"Qdrant health check failed: {e}")
         return f"unreachable: {str(e)}"
-            with_payload=True
