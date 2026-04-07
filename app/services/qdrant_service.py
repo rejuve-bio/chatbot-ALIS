@@ -125,7 +125,9 @@ def search_patient_biomarkers(
         collection_name=PATIENT_COLLECTION,
         query=query_vector,
         query_filter=search_filter,
-        limit=limit
+        limit=limit,
+        with_payload=True
+
     )
 
     return [hit.payload for hit in results.points]
@@ -155,7 +157,9 @@ def search_pc_knowledge(
         collection_name=PC_COLLECTION,
         query=query_vector,
         query_filter=search_filter,
-        limit=limit
+        limit=limit,
+        with_payload=True
+
     )
 
     return [hit.payload for hit in results.points]
@@ -190,3 +194,4 @@ def check_qdrant_health() -> str:
         return "ok"
     except Exception as e:
         return f"unreachable: {str(e)}"
+            with_payload=True
