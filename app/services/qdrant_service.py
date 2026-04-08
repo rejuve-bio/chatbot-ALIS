@@ -60,9 +60,9 @@ def upsert_patient(patient_uuid: str, text_summary: str, vector: list[float], pa
 
 def search_patient(patient_uuid: str, query_vector: list[float]) -> dict | None:
     logger.info(f"Searching Qdrant for patient {patient_uuid}")
-    results = client.search(
+    results = client.query_points(
         collection_name=PATIENT_COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=Filter(
             must=[FieldCondition(
                 key="patient_id",
@@ -72,9 +72,9 @@ def search_patient(patient_uuid: str, query_vector: list[float]) -> dict | None:
         limit=1,
         with_payload=True
     )
-    if results:
+    if results.points:
         logger.info(f"Patient {patient_uuid} found in Qdrant")
-        return results[0].payload
+        return results.points[0].payload
     logger.info(f"Patient {patient_uuid} not found in Qdrant")
     return None
 
@@ -107,29 +107,28 @@ def search_pc_knowledge(query_vector: list[float], pc_group: str = None, limit: 
         search_filter = Filter(
             must=[FieldCondition(key="pc_group", match=MatchValue(value=pc_group.upper()))]
         )
-    results = client.search(
+    results = client.query_points(
         collection_name=PC_COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=search_filter,
         limit=limit,
         with_payload=True
     )
-    logger.info(f"PC knowledge search returned {len(results)} results")
-    return [hit.payload for hit in results]
+    logger.info(f"PC knowledge query_points returned {results} results")
+    return [hit.payload for hit in results.points]
 
 
 def list_patients() -> list[str]:
     logger.info("Listing all patients from Qdrant")
     results, _ = client.scroll(
-        collection_name=PATIENT_COLLECTION,
-        limit=1000,
-        with_payload=True
-    )
+    collection_name=PATIENT_COLLECTION,
+    limit=1000,
+    with_payload=True)
     patients = sorted(set(
-        hit.payload["patient_id"]
-        for hit in results
-        if "patient_id" in hit.payload
-    ))
+                hit.payload["patient_id"]
+                for hit in results
+                if "patient_id" in hit.payload
+            ))
     logger.info(f"Found {len(patients)} patients")
     return patients
 

@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 
 from app.routers import router
 from app.services.qdrant_service import init_collections
+from app.services.codebook import load_codebook
+load_codebook()
 
 logging.basicConfig(
     level=logging.INFO,

@@ -67,9 +67,9 @@ def build_patient_text_summary(data: dict) -> str:
     )
 
 
-def fetch_and_store_patient(patient_uuid: str) -> dict | None:
+def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
     logger.info(f"Fetching patient {patient_uuid} from ALIS API")
-    data = fetch_patient(patient_uuid)
+    data = fetch_patient(patient_uuid, token=token)
     if not data:
         logger.warning(f"No data returned from ALIS API for patient {patient_uuid}")
         return None
@@ -100,7 +100,8 @@ def fetch_and_store_patient(patient_uuid: str) -> dict | None:
 def build_context(
     question: str,
     patient_id: Optional[str] = None,
-    pc_group: Optional[str] = None
+    pc_group: Optional[str] = None,
+    token: Optional[str] = None
 ) -> tuple[str, list[str]]:
     logger.info(f"Building context | patient_id: {patient_id} | pc_group: {pc_group}")
     query_vector = embed_text(question)
@@ -113,16 +114,17 @@ def build_context(
 
         if not patient_payload:
             logger.info(f"Patient {patient_id} not in Qdrant — fetching from ALIS API")
-            patient_payload = fetch_and_store_patient(patient_id)
+            patient_payload = fetch_and_store_patient(patient_id,token=token)
             logger.info(f"ALIS API fetch result: {'success' if patient_payload else 'failed'}")
 
         if patient_payload:
+            from app.services.codebook import get_label
+            
             biomarkers = patient_payload.get("biomarkers", {})
             risks = patient_payload.get("risks", [])
-            label_to_human = patient_payload.get("label_to_human", {})
 
             biomarker_str = "\n".join([
-                f"{label_to_human.get(k, k)} ({k}): {v}"
+                f"{get_label(k)} ({k}): {v}"
                 for k, v in biomarkers.items()
                 if v is not None and k not in ["id", "patient_id", "source", "created_at", "updated_at"]
             ])
@@ -207,12 +209,10 @@ def ingest_pdf(file_bytes: bytes):
     return len(chunks)
 
 
-def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None) -> tuple[str, list[str]]:
-    logger.info(f"RAG query | question: {question[:50]}...")
-    context, sources = build_context(question, patient_id, pc_group)
+def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple[str, list[str]]:
+    context, sources = build_context(question, patient_id, pc_group, token=token)
     prompt = build_prompt(question, context)
     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
-    logger.info(f"RAG answer generated | sources: {sources}")
     return answer, sources
 
 
@@ -222,3 +222,6 @@ def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: 
     prompt = build_prompt(question, context)
     stream = stream_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return stream, sources
+
+
+    
