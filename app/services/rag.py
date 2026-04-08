@@ -113,10 +113,23 @@ def build_context(
         logger.info(f"Qdrant search result for {patient_id}: {'found' if patient_payload else 'not found'}")
 
         if not patient_payload:
-            logger.info(f"Patient {patient_id} not in Qdrant — fetching from ALIS API")
-            patient_payload = fetch_and_store_patient(patient_id,token=token)
-            logger.info(f"ALIS API fetch result: {'success' if patient_payload else 'failed'}")
+            existing = list_patients()
+            if not existing:
+                logger.info("Collection empty — bulk ingesting all patients...")
+                from app.services.alis_api import fetch_all_patients
+                all_patients = fetch_all_patients(token=token)
+                for p in all_patients:
+                    pid = p.get("id")
+                    if pid:
+                        fetch_and_store_patient(pid, token=token)
+                # now try search again
+                patient_payload = search_patient(patient_id, query_vector)
 
+            # if still not found fetch just this one
+            if not patient_payload:
+                logger.info(f"Patient {patient_id} not in Qdrant — fetching from ALIS API")
+                patient_payload = fetch_and_store_patient(patient_id, token=token)
+                
         if patient_payload:
             from app.services.codebook import get_label
             
