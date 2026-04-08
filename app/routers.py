@@ -8,6 +8,7 @@ from app.schema import ChatResponse, HealthCheckResponse
 from app.services.rag import rag_query, rag_query_stream, ingest_excel, ingest_pdf
 from app.services.qdrant_service import list_patients, check_qdrant_health
 from app.services.llm_service import embed_text
+from fastapi import APIRouter, Form, HTTPException, UploadFile, File, Header
 
 logger = logging.getLogger(__name__)
 
@@ -46,26 +47,32 @@ async def chat(
     message: str = Form(...),
     patient_id: Optional[str] = Form(None),
     pc_group: Optional[str] = Form(None),
-    stream: Optional[bool] = Form(False)
+    stream: Optional[bool] = Form(False),
+    authorization = Header(None)
 ):
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+
     logger.info(f"Chat request | patient_id: {patient_id} | pc_group: {pc_group} | message: {message}")
 
-    if stream:
-        logger.info("Streaming response requested")
-        generator, sources = rag_query_stream(
-            question=message,
-            patient_id=patient_id,
-            pc_group=pc_group
-        )
-        def event_stream():
-            for chunk in generator:
-                yield chunk
-        return StreamingResponse(event_stream(), media_type="text/plain")
+    # if stream:
+    #     logger.info("Streaming response requested")
+    #     generator, sources = rag_query_stream(
+    #         question=message,
+    #         patient_id=patient_id,
+    #         pc_group=pc_group,
+    #     )
+    #     def event_stream():
+    #         for chunk in generator:
+    #             yield chunk
+    #     return StreamingResponse(event_stream(), media_type="text/plain")
 
     answer, sources = rag_query(
         question=message,
         patient_id=patient_id,
-        pc_group=pc_group
+        pc_group=pc_group,
+        token = authorization
     )
     logger.info(f"Chat response generated | sources: {sources}")
     return ChatResponse(answer=answer, sources=sources)
