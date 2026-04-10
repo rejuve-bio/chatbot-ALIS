@@ -74,6 +74,7 @@ def search_patient(patient_uuid: str, query_vector: list[float]) -> dict | None:
     )
     if results.points:
         logger.info(f"Patient {patient_uuid} found in Qdrant")
+        logger.debug(f"Patient {patient_uuid} search results: {results.points[0].payload}")
         return results.points[0].payload
     logger.info(f"Patient {patient_uuid} not found in Qdrant")
     return None

@@ -43,8 +43,9 @@ def build_patient_text_summary(data: dict) -> str:
     delta = data.get("latest_delta", "N/A")
     aging_status = "aging faster than normal" if delta and float(delta) > 0 else "aging slower than normal"
 
-    heatmap = data.get("latest_heatmap", {}).get("rows", [])
-    label_to_human = {row["label"]: row["human"] for row in heatmap}
+    heatmap_data = data.get("latest_heatmap", {})
+    heatmap_rows = heatmap_data.get("rows", [])
+    label_to_human = {row["label"]: row["human"] for row in heatmap_rows}
 
     biomarkers = data.get("biomarkers", {})
     biomarker_str = " | ".join([
@@ -59,10 +60,18 @@ def build_patient_text_summary(data: dict) -> str:
         for r in risks[:10]
     ])
 
+    top_pcs = sorted(
+        [(k, v) for k, v in heatmap_data.get("total_pc_contributions", {}).items() if v != 0],
+        key=lambda x: abs(x[1]),
+        reverse=True
+    )[:5]
+    pc_str = " | ".join([f"{pc}: {val:+.2f}" for pc, val in top_pcs])
+
     return (
         f"Patient UUID: {data.get('id')} | SEQN: {seqn} | Gender: {gender} | "
         f"Chronological Age: {chron_age} | Biological Age: {bio_age} | "
         f"Delta: {delta} | Aging Status: {aging_status} | "
+        f"Top PC Contributions: {pc_str} | "
         f"Biomarkers: {biomarker_str} | "
         f"Top Disease Risks: {risk_str}"
     )
@@ -75,11 +84,15 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
         logger.warning(f"No data returned from ALIS API for patient {patient_uuid}")
         return None
 
-    heatmap = data.get("latest_heatmap", {}).get("rows", [])
-    label_to_human = {row["label"]: row["human"] for row in heatmap}
+    heatmap = data.get("latest_heatmap", {})
+    label_to_human = {row["label"]: row["human"] for row in heatmap.get("rows", [])}
+    total_pc_contributions = heatmap.get("total_pc_contributions", {})
 
-    text_summary = build_patient_text_summary(data)
-    vector = embed_text(text_summary)
+    significant_pcs = {k: v for k, v in total_pc_contributions.items() if v != 0}
+    sorted_pcs = sorted(significant_pcs.items(), key=lambda x: abs(x[1]), reverse=True)
+
+    text_summary = build_patient_text_summary(data)  # ← was missing
+    vector = embed_text(text_summary)                 # ← was missing
 
     payload = {
         "seqn": data.get("seqn"),
@@ -90,6 +103,8 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
         "label_to_human": label_to_human,
         "biomarkers": data.get("biomarkers", {}),
         "risks": data.get("risks", []),
+        "total_pc_contributions": total_pc_contributions,
+        "significant_pcs_ranked": sorted_pcs,
         "text_summary": text_summary
     }
 
@@ -137,6 +152,10 @@ def build_context(
             biomarkers = patient_payload.get("biomarkers", {})
             risks = patient_payload.get("risks", [])
 
+            
+
+            logger.info(f"Patient {patient_id} biomarkers: {biomarkers}")
+            logger.info(f"Patient {patient_id} risks: {risks}")
             biomarker_str = "\n".join([
                 f"{get_label(k)} ({k}): {v}"
                 for k, v in biomarkers.items()
@@ -147,6 +166,19 @@ def build_context(
                 f"{r['disease_name']} — evidence score: {r['evidence_score']} — contributing PCs: {', '.join(r['contributing_pcs'])}"
                 for r in risks
             ])
+
+            total_pc_contributions = patient_payload.get("total_pc_contributions", {})
+            significant_pcs = sorted(
+                [(k, v) for k, v in total_pc_contributions.items() if v != 0],
+                key=lambda x: abs(x[1]),
+                reverse=True
+            )
+            pc_contribution_str = "\n".join([
+                f"{pc}: {contribution:+.3f}"
+                for pc, contribution in significant_pcs
+            ])
+
+            context_parts.append(f"\n=== PC Contributions (ranked by magnitude) ===\n{pc_contribution_str}")
 
             context_parts.append("=== Patient Profile ===")
             context_parts.append(
@@ -159,6 +191,7 @@ def build_context(
             )
             context_parts.append(f"\n=== Biomarkers ===\n{biomarker_str}")
             context_parts.append(f"\n=== Disease Risks ===\n{risk_str}")
+            logger.info(f"Patient {patient_id} context parts: {context_parts}")
             sources.append(f"patient:{patient_id}")
             logger.info(f"Patient context built successfully for {patient_id}")
         else:
@@ -181,6 +214,7 @@ def build_context(
             sources.append(f"pc_knowledge:{hit.get('pc_group')}")
 
     context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
+    logger.info("Context built after searching pc knowledge {context_str}")
     return context_str, sources
 
 
