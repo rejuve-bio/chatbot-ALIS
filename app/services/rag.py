@@ -7,8 +7,9 @@ from dotenv import load_dotenv
 from app.services.llm_service import embed_text, call_llm, stream_llm
 from app.services.qdrant_service import (
     search_patient, search_pc_knowledge,
-    upsert_patient
+    upsert_patient,list_patients
 )
+
 from app.services.alis_api import fetch_patient
 from app.services.parsers.excel_parser import parse_excel
 from app.services.parsers.pdf_parser import parse_pdf
@@ -228,13 +229,11 @@ def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optiona
     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return answer, sources
 
-
-def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None) -> tuple:
+def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple:
     logger.info(f"RAG stream query | question: {question[:50]}...")
-    context, sources = build_context(question, patient_id, pc_group)
+    context, sources = build_context(question, patient_id, pc_group, token=token)
     prompt = build_prompt(question, context)
     stream = stream_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return stream, sources
-
 
     

@@ -67,13 +67,14 @@ async def chat(
     #         for chunk in generator:
     #             yield chunk
     #     return StreamingResponse(event_stream(), media_type="text/plain")
-
+    logger.info(f"Authorization header received: {authorization}")
     answer, sources = rag_query(
         question=message,
         patient_id=patient_id,
         pc_group=pc_group,
         token = authorization
     )
+
     logger.info(f"Chat response generated | sources: {sources}")
     return ChatResponse(answer=answer, sources=sources)
 

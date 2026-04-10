@@ -11,18 +11,15 @@ logger = logging.getLogger(__name__)
 ALIS_API_URL = os.getenv("ALIS_API_URL", "http://37.27.231.93:5001")
 
 
-def get_headers():
-    headers = {"Content-Type": "application/json"}
-    if ALIS_API_TOKEN:
-        headers["Authorization"] = f"Bearer {ALIS_API_TOKEN}"
-    return headers
-
 
 def fetch_patient(patient_uuid: str, token: str) -> dict | None:
     url = f"{ALIS_API_URL}/patients/{patient_uuid}"
     headers = {"Content-Type": "application/json"}
     if token:
-        headers["Authorization"] = token 
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+    logger.info(f"Sending Authorization header: {headers.get('Authorization')}")
     logger.info(f"Fetching patient from ALIS API: {url}")
     try:
         response = httpx.get(url, headers=headers, timeout=30.0)
@@ -42,10 +39,13 @@ def fetch_all_patients(token) -> list[dict]:
     url = f"{ALIS_API_URL}/patients"
     headers = {"Content-Type": "application/json"}
     if token:
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
         headers["Authorization"] = token 
+    logger.info(f"Sending Authorization header: {headers.get('Authorization')}")
     logger.info(f"Fetching all patients from ALIS API: {url}")
     try:
-        response = httpx.get(url, headers=get_headers(), timeout=30.0)
+        response = httpx.get(url, headers=headers, timeout=30.0)
         response.raise_for_status()
         data = response.json()
         # response has items key with pagination
