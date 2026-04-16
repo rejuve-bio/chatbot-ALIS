@@ -55,3 +55,47 @@ def fetch_all_patients(token) -> list[dict]:
     except Exception as e:
         logger.error(f"Failed to fetch patients from ALIS API: {e}")
         return []
+
+
+def fetch_longitudinal(
+    patient_id: str,
+    token: str,
+    biomarkers: list[str] = None,
+    pcs: list[str] = None,
+) -> dict | None:
+    """
+    Fetch longitudinal time series data for a patient.
+    biomarkers: list of variable codes e.g. ["BPXPLS", "BPXSAR"]
+    pcs: list of PC names e.g. ["PC1", "PC2"]
+    """
+    url = f"{ALIS_API_URL}/patients/{patient_id}/longitudinal"
+
+    params = []
+    for b in (biomarkers or []):
+        params.append(("biomarkers", b))
+    for p in (pcs or []):
+        params.append(("pcs", p))
+
+    headers = {"Content-Type": "application/json"}
+    if token:
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+
+    logger.info(
+        f"Fetching longitudinal data for patient {patient_id} | "
+        f"biomarkers={biomarkers} | pcs={pcs}"
+    )
+
+    try:
+        response = httpx.get(url, headers=headers, params=params, timeout=30.0)
+        if response.status_code == 404:
+            logger.warning(f"No longitudinal data for patient {patient_id}")
+            return None
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Longitudinal data fetched successfully for {patient_id}")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to fetch longitudinal data for {patient_id}: {e}")
+        return None
