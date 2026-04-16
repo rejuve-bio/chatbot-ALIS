@@ -29,6 +29,12 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
+def _truncate_to_sentences(text: str, max_sentences: int = 3) -> str:
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return " ".join(sentences[:max_sentences])
+
+
 def call_llm(prompt: str, system_prompt: str = None) -> str:
     messages = []
     if system_prompt:
@@ -41,7 +47,7 @@ def call_llm(prompt: str, system_prompt: str = None) -> str:
         timeout=120.0
     )
     response.raise_for_status()
-    return response.json()["message"]["content"]
+    return _truncate_to_sentences(response.json()["message"]["content"])
 
 
 def stream_llm(prompt: str, system_prompt: str = None):

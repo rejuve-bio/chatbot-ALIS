@@ -21,17 +21,14 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-You are a clinical assistant for the LinAge2 longevity research platform.
-Answer clinician questions clearly and concisely.
+You are a clinical assistant. Answer in 2 sentences maximum.
 
 Rules:
-- Keep answers short and to the point
-- Use plain text, no markdown, no headers, no bullet points
-- Only include what is directly relevant to the question
-- Analyze biomarker values yourself and identify patterns
-- If data is missing say so in one sentence
-- Never repeat the same information twice
-- Never give medical advice, only clinical observations based on data
+- Answer ONLY what was asked. Nothing more.
+- Do NOT list diseases, mechanisms, interventions, or risk windows.
+- Do NOT summarize all available data.
+- State the single most important clinical finding for this patient.
+- If a PC does not apply to this patient's gender, say so and give the correct PC value in one sentence.
 """
 
 
@@ -201,17 +198,59 @@ def build_context(
     pc_hits = search_pc_knowledge(query_vector, pc_group=pc_group, limit=3)
     logger.info(f"PC knowledge hits: {len(pc_hits)}")
     if pc_hits:
+        patient_gender = (patient_payload or {}).get("gender", "").lower()  # "female" or "male"
+        total_pc_contributions = (patient_payload or {}).get("total_pc_contributions", {})
         context_parts.append("\n=== PC Clinical Interpretation ===")
         for hit in pc_hits:
-            context_parts.append(
-                f"PC Group: {hit.get('pc_group')} | "
-                f"Risk Window: {hit.get('risk_window')} | "
-                f"Causes of Death: {', '.join(hit.get('causes_of_death', []))} | "
-                f"Associated Diseases: {', '.join(hit.get('diseases', []))} | "
-                f"Mechanisms: {', '.join(hit.get('mechanisms', []))} | "
-                f"Interventions: {', '.join(hit.get('interventions', []))}"
+            hit_pc_group = hit.get("pc_group", "")
+            # detect gender suffix on the PC group name (e.g. PC1M, PC2F)
+            hit_suffix = hit_pc_group[-1].lower() if hit_pc_group and hit_pc_group[-1].lower() in ("m", "f") else None
+            gender_mismatch = (
+                hit_suffix == "m" and patient_gender == "female"
+                or hit_suffix == "f" and patient_gender == "male"
             )
-            sources.append(f"pc_knowledge:{hit.get('pc_group')}")
+            if gender_mismatch:
+                correct_suffix = "F" if hit_suffix == "m" else "M"
+                correct_pc_group = hit_pc_group[:-1] + correct_suffix
+                # the patient's contribution key is the number part only e.g. "PC1"
+                pc_number = hit_pc_group[:-1]  # e.g. "PC1" from "PC1M"
+                patient_pc_value = total_pc_contributions.get(pc_number)
+
+                context_parts.append(
+                    f"NOTE: The clinician asked about {hit_pc_group} but this patient is {patient_gender}. "
+                    f"The gender-appropriate knowledge is {correct_pc_group}."
+                )
+                if patient_pc_value is not None:
+                    context_parts.append(
+                        f"This patient's {pc_number} contribution is {patient_pc_value:+.3f}."
+                    )
+
+                # fetch the correct gender's PC knowledge and include it
+                correct_hits = search_pc_knowledge(query_vector, pc_group=correct_pc_group, limit=2)
+                if correct_hits:
+                    for correct_hit in correct_hits:
+                        context_parts.append(
+                            f"PC Group: {correct_hit.get('pc_group')} | "
+                            f"Risk Window: {correct_hit.get('risk_window')} | "
+                            f"Causes of Death: {', '.join(correct_hit.get('causes_of_death', []))} | "
+                            f"Associated Diseases: {', '.join(correct_hit.get('diseases', []))} | "
+                            f"Mechanisms: {', '.join(correct_hit.get('mechanisms', []))} | "
+                            f"Interventions: {', '.join(correct_hit.get('interventions', []))}"
+                        )
+                    sources.append(f"pc_knowledge:{correct_pc_group}")
+                else:
+                    context_parts.append(f"No knowledge found for {correct_pc_group} in the database.")
+                sources.append(f"pc_knowledge:{hit_pc_group}:redirected_to:{correct_pc_group}")
+            else:
+                context_parts.append(
+                    f"PC Group: {hit_pc_group} | "
+                    f"Risk Window: {hit.get('risk_window')} | "
+                    f"Causes of Death: {', '.join(hit.get('causes_of_death', []))} | "
+                    f"Associated Diseases: {', '.join(hit.get('diseases', []))} | "
+                    f"Mechanisms: {', '.join(hit.get('mechanisms', []))} | "
+                    f"Interventions: {', '.join(hit.get('interventions', []))}"
+                )
+                sources.append(f"pc_knowledge:{hit_pc_group}")
 
     context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
     logger.info("Context built after searching pc knowledge {context_str}")
@@ -257,11 +296,11 @@ def ingest_pdf(file_bytes: bytes):
     return len(chunks)
 
 
-def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple[str, list[str]]:
-    context, sources = build_context(question, patient_id, pc_group, token=token)
-    prompt = build_prompt(question, context)
-    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
-    return answer, sources
+# def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple[str, list[str]]:
+#     context, sources = build_context(question, patient_id, pc_group, token=token)
+#     prompt = build_prompt(question, context)
+#     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
+#     return answer, sources
 
 def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple:
     logger.info(f"RAG stream query | question: {question[:50]}...")
@@ -271,3 +310,41 @@ def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: 
     return stream, sources
 
     
+from app.services.codebook import is_longitudinal_question
+from app.services.longitudinal import answer_longitudinal_question
+
+
+def rag_query(
+    question: str,
+    patient_id: Optional[str] = None,
+    pc_group: Optional[str] = None,
+    token: Optional[str] = None
+) -> tuple[str, list[str]]:
+
+    # NEW: detect and route longitudinal questions
+    if patient_id and is_longitudinal_question(question):
+        logger.info(f"Longitudinal question detected for patient {patient_id}")
+
+        # fetch patient profile from Qdrant to enrich context
+        query_vector = embed_text(question)
+        logger.info(f"Embedding question for longitudinal query: {query_vector[:5]}...")
+        patient_payload = search_patient(patient_id, query_vector)
+        logger.info(f"Qdrant search for longitudinal query: {patient_payload}")
+        # if not in Qdrant yet, fetch and store first
+        if not patient_payload:
+            logger.info(f"Patient {patient_id} not in Qdrant — fetching before longitudinal query")
+            patient_payload = fetch_and_store_patient(patient_id, token=token)
+
+        return answer_longitudinal_question(
+            question=question,
+            patient_id=patient_id,
+            token=token,
+            patient_payload=patient_payload,
+            llm_generate=lambda prompt: call_llm(prompt),
+        )
+
+    # EXISTING: original rag flow unchanged below this point
+    context, sources = build_context(question, patient_id, pc_group, token=token)
+    prompt = build_prompt(question, context)
+    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
+    return answer, sources
