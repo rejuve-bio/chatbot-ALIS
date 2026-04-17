@@ -29,10 +29,32 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
-def _truncate_to_sentences(text: str, max_sentences: int = 3) -> str:
+def _clean_response(text: str) -> str:
+    """
+    Strip unintended markdown (headers, bold, bullets) while preserving
+    proper markdown table syntax so the frontend can render it.
+    """
     import re
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    return " ".join(sentences[:max_sentences])
+    lines = text.strip().splitlines()
+    cleaned = []
+    for line in lines:
+        # preserve markdown table rows but strip bold/italic inside cells
+        if re.match(r"^\s*\|", line):
+            line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
+            cleaned.append(line)
+            continue
+        # strip leading markdown headers (#, ##, ###)
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        # strip bold/italic markers
+        line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
+        # convert bullet/dash list items to plain lines
+        line = re.sub(r"^\s*[-*]\s+", "", line)
+        # strip numbered list markers (1. 2. etc)
+        line = re.sub(r"^\s*\d+\.\s+", "", line)
+        cleaned.append(line)
+    # collapse multiple blank lines into one
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned))
+    return result.strip()
 
 
 def call_llm(prompt: str, system_prompt: str = None) -> str:
@@ -47,7 +69,7 @@ def call_llm(prompt: str, system_prompt: str = None) -> str:
         timeout=120.0
     )
     response.raise_for_status()
-    return _truncate_to_sentences(response.json()["message"]["content"])
+    return _clean_response(response.json()["message"]["content"])
 
 
 def stream_llm(prompt: str, system_prompt: str = None):

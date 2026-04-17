@@ -11,9 +11,15 @@ from app.services.llm_service import call_llm
 logger = logging.getLogger(__name__)
 
 LONGITUDINAL_SYSTEM_PROMPT = """
-You are a clinical assistant. Answer in 2 to 3 sentences only. Plain text. No markdown, no bullets, no headers, no bold.
+You are a clinical assistant for the LinAge2 biological aging platform.
 
-Start with the clinical finding. Be specific to this patient's data. Do not explain what measurements are. Do not give generic information.
+Rules:
+- The data provided has already been fetched and verified. Always answer using it — never say data is unavailable.
+- When the data contains multiple time points (dates + values), present it as a Markdown table: | Date | Value | Change |
+- After the table, add one sentence summarizing the clinical trend (improving, worsening, stable) and magnitude.
+- For biological age questions, include a table of bio_age, chron_age, and delta per visit, then state the overall direction.
+- If only one data point exists, state the single value and note there is insufficient history to determine a trend.
+- Do not explain what measurements are. Do not give generic information.
 """
 
 
@@ -51,16 +57,22 @@ Reply with ONLY a JSON object in this exact format, nothing else:
 
 Rules:
 - Only include variables directly relevant to the question
-- For questions about aging, delta, or biological age use empty biomarkers and pcs lists — those come from clock_results automatically
-- If unsure, include the most likely variable rather than leaving it empty
+- For questions about blood work, biomarkers, or lab results: include only biomarker codes, leave pcs as empty list
+- For questions about aging, delta, biological age, or clock results: leave both biomarkers and pcs as empty lists — those come from clock_results automatically
+- For questions explicitly about a specific PC (e.g. "how has PC1 changed"): include it in pcs, leave biomarkers empty
+- If unsure, include the most likely biomarker variable rather than leaving it empty
 - Maximum 5 biomarker codes
 """
 
     try:
         import json
+        import re
         response = llm_generate(prompt)
-        # strip any markdown fences if present
-        cleaned = response.strip().replace("```json", "").replace("```", "").strip()
+        # extract the first JSON object from the response
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON object found in LLM response")
+        cleaned = match.group(0)
         parsed = json.loads(cleaned)
         biomarkers = parsed.get("biomarkers", [])
         pcs = parsed.get("pcs", [])
@@ -133,7 +145,7 @@ def _format_longitudinal_context(
             f"Top Disease Risks: {top_risks}"
         )
 
-    # biomarker time series
+    # biomarker time series — pre-built as markdown tables
     biomarker_data = data.get("biomarkers", {})
     if biomarker_data:
         parts.append("=== Biomarker Time Series ===")
@@ -143,27 +155,35 @@ def _format_longitudinal_context(
             if not readings:
                 parts.append("  No readings available")
             else:
+                rows = ["| Date | Value | Change |", "|---|---|---|"]
+                prev_val = None
                 for r in readings:
                     date = r.get("date", "unknown date")
                     value = r.get("value", "N/A")
-                    parts.append(f"  {date}: {value}")
+                    if prev_val is not None and isinstance(value, (int, float)) and isinstance(prev_val, (int, float)):
+                        change = f"{value - prev_val:+.3f}"
+                    else:
+                        change = "—"
+                    rows.append(f"| {date} | {value} | {change} |")
+                    if isinstance(value, (int, float)):
+                        prev_val = value
+                parts.append("\n".join(rows))
 
-    # clock results over time
-    clock_results = data.get("clock_results", [])
+    # clock results — only include if the question is about biological age or aging
+    age_keywords = ["bio age", "biological age", "delta", "aging", "clock", "older", "younger"]
+    include_clock = any(kw in question.lower() for kw in age_keywords)
+    clock_results = data.get("clock_results", []) if include_clock else []
     if clock_results:
         parts.append("\n=== Biological Age Over Time ===")
+        rows = ["| Date | Bio Age | Chron Age | Delta |", "|---|---|---|---|"]
         for cr in clock_results:
             date = cr.get("date", "unknown")
             bio_age = cr.get("bio_age", "N/A")
             chron_age = cr.get("chron_age", "N/A")
             delta = cr.get("delta", "N/A")
-            parts.append(
-                f"  {date}: bio_age={bio_age} | "
-                f"chron_age={chron_age} | delta={delta:+.4f}"
-                if isinstance(delta, float) else
-                f"  {date}: bio_age={bio_age} | "
-                f"chron_age={chron_age} | delta={delta}"
-            )
+            delta_str = f"{delta:+.4f}" if isinstance(delta, float) else str(delta)
+            rows.append(f"| {date} | {bio_age} | {chron_age} | {delta_str} |")
+        parts.append("\n".join(rows))
 
     # PC values over time
     pc_data = data.get("pcs", {})

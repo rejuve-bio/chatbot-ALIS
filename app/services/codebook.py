@@ -64,13 +64,17 @@ def is_longitudinal_question(question: str) -> bool:
     change over time before sending to the LLM.
     """
     triggers = [
-        "change", "changed", "trend", "over time", "history",
-        "last month", "last week", "last year", "past month",
-        "past week", "past year", "after", "before", "since",
-        "progress", "progression", "improve", "improved",
-        "worsen", "worsened", "increase", "decrease", "fluctuat",
-        "how has", "how did", "how have", "longitudinal",
-        "time series", "over the", "across visits", "between visits"
+        "over time", "over the past", "over the last",
+        "trend", "trending", "history",
+        "last month", "last week", "last year", "last visit",
+        "past month", "past week", "past year",
+        "after", "before", "since",
+        "across visits", "between visits", "previous visit",
+        "has changed", "have changed", "has increased", "has decreased",
+        "has worsened", "has improved", "has it changed",
+        "how has", "how have", "how did it",
+        "longitudinal", "time series", "time-series",
+        "since last", "compared to last", "compared to previous",
     ]
     q = question.lower()
     return any(t in q for t in triggers)

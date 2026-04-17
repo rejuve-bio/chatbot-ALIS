@@ -21,14 +21,27 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-You are a clinical assistant. Answer in 2 sentences maximum.
+You are a clinical assistant for the LinAge2 biological aging platform. Your job is to synthesize patient data and tell the clinician what matters most for this specific patient.
 
-Rules:
-- Answer ONLY what was asked. Nothing more.
-- Do NOT list diseases, mechanisms, interventions, or risk windows.
-- Do NOT summarize all available data.
-- State the single most important clinical finding for this patient.
-- If a PC does not apply to this patient's gender, say so and give the correct PC value in one sentence.
+FORMATTING:
+- For PC ranking questions: the context has a pre-built "PC Contributions Table" — output it as-is, then one sentence on the most urgent PC and why.
+- For biomarker driver questions: use the biomarker names and values from the context to build a | table (Code | Name | Patient Value | Interpretation), then one synthesis sentence.
+- For PC comparison questions: output a | table (Dimension | PC_A | PC_B), then one sentence on the key clinical difference.
+- When the context includes longitudinal time-series data: the context has pre-built "| Date | Value | Change |" tables — output them as-is, then one sentence on the clinical trend per biomarker.
+- For biological age trend questions: the context has a pre-built "| Date | Bio Age | Chron Age | Delta |" table — output it as-is, then state the overall direction.
+- For all other questions: answer in 3-5 sentences using only findings relevant to this patient's actual values.
+
+CLINICAL RULES:
+- PC contribution values must always include direction: positive = accelerating aging, negative = protective.
+- If a PC does not match the patient gender, state the correct PC in one sentence then immediately answer using it. Never stop at the redirect.
+- The biomarker names and what they measure are in the context — use those labels to reason about which biomarkers are relevant to the question. Do not guess codes from memory.
+- If the question is about data not available in LinAge2, say: "This information is not available in LinAge2. Please refer to the patient's EHR."
+- Only answer what was asked. If the question is about blood work, do not mention PC contributions, disease risks, or biological age. If the question is about aging, do not list raw biomarker values.
+
+SYNTHESIS:
+- End every answer with one sentence stating the single most actionable clinical implication, grounded in this patient's specific values.
+- Never give generic advice. Every synthesis sentence must cite an actual number from the context.
+- Never add filler like "if you need more details", "consult clinical guidelines", "feel free to ask", or "for further interpretation". Stop after the synthesis sentence.
 """
 
 
@@ -114,12 +127,15 @@ def build_context(
     question: str,
     patient_id: Optional[str] = None,
     pc_group: Optional[str] = None,
-    token: Optional[str] = None
-) -> tuple[str, list[str]]:
+    token: Optional[str] = None,
+    query_vector: Optional[list] = None,
+) -> tuple[str, list[str], Optional[dict]]:
     logger.info(f"Building context | patient_id: {patient_id} | pc_group: {pc_group}")
-    query_vector = embed_text(question)
+    if query_vector is None:
+        query_vector = embed_text(question)
     context_parts = []
     sources = []
+    patient_payload = None
 
     if patient_id:
         patient_payload = search_patient(patient_id, query_vector)
@@ -170,12 +186,15 @@ def build_context(
                 key=lambda x: abs(x[1]),
                 reverse=True
             )
-            pc_contribution_str = "\n".join([
-                f"{pc}: {contribution:+.3f}"
-                for pc, contribution in significant_pcs
-            ])
 
-            context_parts.append(f"\n=== PC Contributions (ranked by magnitude) ===\n{pc_contribution_str}")
+            # pre-built markdown table for "most significant PCs" questions
+            pc_table_rows = ["| PC | Contribution | Direction |", "|---|---|---|"]
+            for pc, val in significant_pcs[:8]:
+                direction = "Aging faster" if val > 0 else "Protective"
+                pc_table_rows.append(f"| {pc} | {val:+.3f} yrs | {direction} |")
+            pc_table = "\n".join(pc_table_rows)
+
+            context_parts.append(f"\n=== PC Contributions Table ===\n{pc_table}")
 
             context_parts.append("=== Patient Profile ===")
             context_parts.append(
@@ -254,7 +273,7 @@ def build_context(
 
     context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
     logger.info("Context built after searching pc knowledge {context_str}")
-    return context_str, sources
+    return context_str, sources, patient_payload
 
 
 def build_prompt(question: str, context: str) -> str:
@@ -304,47 +323,81 @@ def ingest_pdf(file_bytes: bytes):
 
 def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple:
     logger.info(f"RAG stream query | question: {question[:50]}...")
-    context, sources = build_context(question, patient_id, pc_group, token=token)
+    context, sources, _ = build_context(question, patient_id, pc_group, token=token)
     prompt = build_prompt(question, context)
     stream = stream_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return stream, sources
 
     
-from app.services.codebook import is_longitudinal_question
-from app.services.longitudinal import answer_longitudinal_question
+from app.services.longitudinal import _extract_variables_with_llm, _format_longitudinal_context
+from app.services.alis_api import fetch_longitudinal
+from app.services.codebook import get_force_included_variables
 
 
 def rag_query(
     question: str,
     patient_id: Optional[str] = None,
     pc_group: Optional[str] = None,
-    token: Optional[str] = None
+    token: Optional[str] = None,
 ) -> tuple[str, list[str]]:
+    from concurrent.futures import ThreadPoolExecutor
 
-    # NEW: detect and route longitudinal questions
-    if patient_id and is_longitudinal_question(question):
-        logger.info(f"Longitudinal question detected for patient {patient_id}")
+    # PARALLEL 1: embed question + ask LLM which longitudinal variables are needed
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        embed_future = executor.submit(embed_text, question)
+        if patient_id:
+            available = get_force_included_variables()
+            longitudinal_vars_future = executor.submit(
+                _extract_variables_with_llm,
+                question,
+                available,
+                lambda p: call_llm(p),
+            )
+        else:
+            longitudinal_vars_future = None
 
-        # fetch patient profile from Qdrant to enrich context
-        query_vector = embed_text(question)
-        logger.info(f"Embedding question for longitudinal query: {query_vector[:5]}...")
-        patient_payload = search_patient(patient_id, query_vector)
-        logger.info(f"Qdrant search for longitudinal query: {patient_payload}")
-        # if not in Qdrant yet, fetch and store first
-        if not patient_payload:
-            logger.info(f"Patient {patient_id} not in Qdrant — fetching before longitudinal query")
-            patient_payload = fetch_and_store_patient(patient_id, token=token)
+    query_vector = embed_future.result()
+    biomarkers, pcs = longitudinal_vars_future.result() if longitudinal_vars_future else ([], [])
+    needs_longitudinal = bool(biomarkers or pcs)
+    logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
 
-        return answer_longitudinal_question(
-            question=question,
+    # PARALLEL 2: build Qdrant context + fetch longitudinal data (if needed)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        context_future = executor.submit(
+            build_context, question, patient_id, pc_group, token, query_vector
+        )
+        longitudinal_future = executor.submit(
+            fetch_longitudinal,
             patient_id=patient_id,
             token=token,
-            patient_payload=patient_payload,
-            llm_generate=lambda prompt: call_llm(prompt),
-        )
+            biomarkers=biomarkers,
+            pcs=pcs,
+        ) if (patient_id and needs_longitudinal) else None
 
-    # EXISTING: original rag flow unchanged below this point
-    context, sources = build_context(question, patient_id, pc_group, token=token)
+    context, sources, patient_payload = context_future.result()
+
+    # if longitudinal data was fetched, use the focused longitudinal prompt
+    # (model follows the table instruction reliably with the dedicated prompt)
+    if longitudinal_future:
+        longitudinal_data = longitudinal_future.result()
+        if longitudinal_data:
+            from app.services.longitudinal import LONGITUDINAL_SYSTEM_PROMPT
+            long_context = _format_longitudinal_context(
+                question=question,
+                data=longitudinal_data,
+                biomarkers_requested=biomarkers,
+                pcs_requested=pcs,
+                patient_payload=patient_payload,
+            )
+            sources.append(f"longitudinal:{patient_id}")
+            for b in biomarkers:
+                sources.append(f"biomarker:{b}")
+            for p in pcs:
+                sources.append(f"pc_longitudinal:{p}")
+            prompt = build_prompt(question, long_context)
+            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT)
+            return answer, sources
+
     prompt = build_prompt(question, context)
     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return answer, sources
