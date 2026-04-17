@@ -10,11 +10,13 @@ from app.services.qdrant_service import (
     upsert_patient,list_patients
 )
 
-from app.services.alis_api import fetch_patient
+from app.services.alis_api import fetch_patient,fetch_longitudinal
 from app.services.parsers.excel_parser import parse_excel
 from app.services.parsers.pdf_parser import parse_pdf
 from app.services.llm_service import embed_batch
-from app.services.qdrant_service import upsert_pc_chunks
+from app.services.qdrant_service import upsert_pc_chunks    
+from app.services.longitudinal import _extract_variables_with_llm, _format_longitudinal_context
+from app.services.codebook import get_force_included_variables
 
 load_dotenv()
 
@@ -315,12 +317,6 @@ def ingest_pdf(file_bytes: bytes):
     return len(chunks)
 
 
-# def rag_query(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple[str, list[str]]:
-#     context, sources = build_context(question, patient_id, pc_group, token=token)
-#     prompt = build_prompt(question, context)
-#     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
-#     return answer, sources
-
 def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple:
     logger.info(f"RAG stream query | question: {question[:50]}...")
     context, sources, _ = build_context(question, patient_id, pc_group, token=token)
@@ -328,40 +324,31 @@ def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: 
     stream = stream_llm(prompt, system_prompt=SYSTEM_PROMPT)
     return stream, sources
 
-    
-from app.services.longitudinal import _extract_variables_with_llm, _format_longitudinal_context
-from app.services.alis_api import fetch_longitudinal
-from app.services.codebook import get_force_included_variables
-
-
 def rag_query(
     question: str,
     patient_id: Optional[str] = None,
     pc_group: Optional[str] = None,
     token: Optional[str] = None,
 ) -> tuple[str, list[str]]:
-    from concurrent.futures import ThreadPoolExecutor
 
-    # PARALLEL 1: embed question + ask LLM which longitudinal variables are needed
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        embed_future = executor.submit(embed_text, question)
-        if patient_id:
-            available = get_force_included_variables()
-            longitudinal_vars_future = executor.submit(
-                _extract_variables_with_llm,
-                question,
-                available,
-                lambda p: call_llm(p),
-            )
-        else:
-            longitudinal_vars_future = None
+    # STEP 1: embed first (blocking)
+    query_vector = embed_text(question)
 
-    query_vector = embed_future.result()
-    biomarkers, pcs = longitudinal_vars_future.result() if longitudinal_vars_future else ([], [])
+    # STEP 2: then ask LLM for variable extraction (after embed is done)
+    biomarkers, pcs = [], []
+    if patient_id:
+        available = get_force_included_variables()
+        biomarkers, pcs = _extract_variables_with_llm(
+            question,
+            available,
+            lambda p: call_llm(p),
+        )
+
     needs_longitudinal = bool(biomarkers or pcs)
     logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
 
-    # PARALLEL 2: build Qdrant context + fetch longitudinal data (if needed)
+    # STEP 3: NOW parallel is safe — both are API calls, not Ollama
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as executor:
         context_future = executor.submit(
             build_context, question, patient_id, pc_group, token, query_vector
@@ -376,8 +363,6 @@ def rag_query(
 
     context, sources, patient_payload = context_future.result()
 
-    # if longitudinal data was fetched, use the focused longitudinal prompt
-    # (model follows the table instruction reliably with the dedicated prompt)
     if longitudinal_future:
         longitudinal_data = longitudinal_future.result()
         if longitudinal_data:
@@ -390,10 +375,6 @@ def rag_query(
                 patient_payload=patient_payload,
             )
             sources.append(f"longitudinal:{patient_id}")
-            for b in biomarkers:
-                sources.append(f"biomarker:{b}")
-            for p in pcs:
-                sources.append(f"pc_longitudinal:{p}")
             prompt = build_prompt(question, long_context)
             answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT)
             return answer, sources
