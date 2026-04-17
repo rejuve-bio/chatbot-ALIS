@@ -94,7 +94,7 @@ def fetch_longitudinal(
             return None
         response.raise_for_status()
         data = response.json()
-        logger.info(f"Longitudinal data fetched successfully for {patient_id}")
+        logger.info(f"Longitudinal data fetched successfully for {patient_id} {data}")
         return data
     except Exception as e:
         logger.error(f"Failed to fetch longitudinal data for {patient_id}: {e}")
