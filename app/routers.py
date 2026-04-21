@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 
 from app.schema import ChatResponse, HealthCheckResponse
-from app.services.rag import rag_query, rag_query_stream, ingest_excel, ingest_pdf
+from app.services.rag import rag_query, rag_query_stream, ingest_excel, ingest_pdf, fetch_and_store_patient
 from app.services.qdrant_service import list_patients, check_qdrant_health
 from app.services.llm_service import embed_text
 from fastapi import APIRouter, Form, HTTPException, UploadFile, File, Header
@@ -40,6 +40,30 @@ def get_patients():
     except Exception as e:
         logger.error(f"Failed to fetch patients: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/patients/resync")
+async def resync_patients(authorization: str = Header(None)):
+    """Re-fetch all patients from ALIS API and update Qdrant with latest data (names, events, biomarkers)."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+    from app.services.alis_api import fetch_all_patients
+    patients = fetch_all_patients(token=authorization)
+    if not patients:
+        raise HTTPException(status_code=502, detail="No patients returned from ALIS API")
+    updated, errors = 0, []
+    for p in patients:
+        pid = p.get("id")
+        if not pid:
+            continue
+        try:
+            fetch_and_store_patient(pid, token=authorization)
+            updated += 1
+        except Exception as e:
+            logger.error(f"Failed to resync patient {pid}: {e}")
+            errors.append(pid)
+    logger.info(f"Resync complete | updated={updated} | errors={len(errors)}")
+    return {"updated": updated, "errors": errors}
 
 
 @router.post("/chat")
