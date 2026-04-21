@@ -39,6 +39,9 @@ Trend: one sentence on direction and magnitude.
 Trend: one sentence on overall direction.
 
 - If only one data point exists, state the single value and note there is insufficient history to determine a trend.
+- If the context includes a "Patient Life Events" section, use those dates to correlate biomarker changes with events (e.g. exercise start, medication change). Explicitly note values before vs. after the event.
+- When answering questions about an intervention (exercise, medication, diet), identify the event date and compare readings before and after it.
+- Refer to the patient by name if a name is available in the profile; otherwise use SEQN.
 - Do not explain what measurements are. Do not give generic information.
 - Do not use pipe tables (|). Use ## headers and bullet points only.
 """
@@ -157,14 +160,25 @@ def _format_longitudinal_context(
         )[:5]
         pc_str = " | ".join([f"{pc}: {val:+.3f}" for pc, val in sig_pcs])
 
+        first = (patient_payload.get("first_name") or "").strip()
+        last = (patient_payload.get("last_name") or "").strip()
+        display_name = f"{first} {last}".strip() if (first or last) else f"SEQN {seqn}"
+
+        clinician = patient_payload.get("clinician_name") or "N/A"
         parts.append(
             f"=== Patient Profile ===\n"
-            f"SEQN: {seqn} | Gender: {gender} | "
+            f"Name: {display_name} | SEQN: {seqn} | Gender: {gender} | "
             f"Chronological Age: {chron} | Biological Age: {bio} | "
-            f"Delta: {delta} | Status: {aging_status}\n"
+            f"Delta: {delta} | Status: {aging_status} | Clinician: {clinician}\n"
             f"Top PC Contributions: {pc_str}\n"
             f"Top Disease Risks: {top_risks}"
         )
+
+        events = patient_payload.get("events", [])
+        if events:
+            parts.append("\n=== Patient Life Events ===")
+            for e in sorted(events, key=lambda x: x.get("date", "")):
+                parts.append(f"- {_format_date(e.get('date', 'unknown'))}: {e.get('label', '')}")
 
     # biomarker time series — pre-built as markdown tables
     biomarker_data = data.get("biomarkers", {})

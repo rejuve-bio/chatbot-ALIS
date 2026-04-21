@@ -119,17 +119,20 @@ def search_pc_knowledge(query_vector: list[float], pc_group: str = None, limit: 
     return [hit.payload for hit in results.points]
 
 
-def list_patients() -> list[str]:
+def list_patients() -> list[dict]:
     logger.info("Listing all patients from Qdrant")
     results, _ = client.scroll(
-    collection_name=PATIENT_COLLECTION,
-    limit=1000,
-    with_payload=True)
-    patients = sorted(set(
-                hit.payload["patient_id"]
-                for hit in results
-                if "patient_id" in hit.payload
-            ))
+        collection_name=PATIENT_COLLECTION,
+        limit=1000,
+        with_payload=True,
+    )
+    seen_ids: set[str] = set()
+    patients = []
+    for hit in results:
+        pid = hit.payload.get("patient_id")
+        if pid and pid not in seen_ids:
+            seen_ids.add(pid)
+            patients.append({"id": pid, "payload": hit.payload})
     logger.info(f"Found {len(patients)} patients")
     return patients
 

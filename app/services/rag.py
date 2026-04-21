@@ -39,12 +39,30 @@ CLINICAL RULES:
 - The biomarker names and what they measure are in the context — use those labels to reason about which biomarkers are relevant to the question. Do not guess codes from memory.
 - If the question is about data not available in LinAge2, say: "This information is not available in LinAge2. Please refer to the patient's EHR."
 - Only answer what was asked. If the question is about blood work, do not mention PC contributions, disease risks, or biological age. If the question is about aging, do not list raw biomarker values.
+- The context may include a "Patient Life Events" section listing dated events such as exercise start, diet changes, or medication changes. Always check this section first when the question is about lifestyle interventions, medication history, or when something started or changed. Answer directly from those dates — never say the information is unavailable if it is present in that section.
+- If no patient is selected and an "All Patients Summary" is provided, answer using that data — list patients, compare values, or summarize the population as asked.
+- If no patient is selected and the question requires a single specific patient's data, say: "No patient is currently selected. Please select a patient to answer this question."
 
 SYNTHESIS:
 - End every answer with one sentence stating the single most actionable clinical implication, grounded in this patient's specific values.
 - Never give generic advice. Every synthesis sentence must cite an actual number from the context.
 - Never add filler like "if you need more details", "consult clinical guidelines", "feel free to ask", or "for further interpretation". Stop after the synthesis sentence.
+
+- CRITICAL: The context may include a "=== Patient Life Events ===" section. 
+  When the question asks about when something started, changed, or happened 
+  (exercise, diet, medication, etc.), you MUST look at this section FIRST. 
+  If the answer is there, answer ONLY from that section in one sentence. 
+  Do NOT say the information is unavailable. Do NOT mention PCs or disease risks.
+  Example: "The patient started exercise on March 20, 2026."
 """
+
+
+def _patient_display_name(payload: dict) -> str:
+    first = (payload.get("first_name") or "").strip()
+    last = (payload.get("last_name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    return f"SEQN {payload.get('seqn', 'unknown')}"
 
 
 def build_patient_text_summary(data: dict) -> str:
@@ -108,6 +126,8 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
 
     payload = {
         "seqn": data.get("seqn"),
+        "first_name": data.get("first_name"),
+        "last_name": data.get("last_name"),
         "gender": data.get("gender"),
         "latest_chron_age": data.get("latest_chron_age"),
         "latest_bio_age": data.get("latest_bio_age"),
@@ -117,6 +137,8 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
         "risks": data.get("risks", []),
         "total_pc_contributions": total_pc_contributions,
         "significant_pcs_ranked": sorted_pcs,
+        "events": data.get("events", []),
+        "clinician_name": (data.get("clinician") or {}).get("name"),
         "text_summary": text_summary
     }
 
@@ -160,6 +182,14 @@ def build_context(
             if not patient_payload:
                 logger.info(f"Patient {patient_id} not in Qdrant — fetching from ALIS API")
                 patient_payload = fetch_and_store_patient(patient_id, token=token)
+
+        # stale record — missing any field added after initial ingest — refresh silently
+        new_fields = {"events", "first_name", "last_name", "clinician_name"}
+        if patient_payload and not new_fields.issubset(patient_payload.keys()) and token:
+            logger.info(f"Patient {patient_id} has stale record (missing new fields) — refreshing from ALIS API")
+            refreshed = fetch_and_store_patient(patient_id, token=token)
+            if refreshed:
+                patient_payload = refreshed
                 
         if patient_payload:
             from app.services.codebook import get_label
@@ -200,13 +230,25 @@ def build_context(
 
             context_parts.append("=== Patient Profile ===")
             context_parts.append(
+                f"Name: {_patient_display_name(patient_payload)} | "
                 f"Patient ID: {patient_id} | "
                 f"SEQN: {patient_payload.get('seqn')} | "
                 f"Gender: {patient_payload.get('gender')} | "
                 f"Chronological Age: {patient_payload.get('latest_chron_age')} | "
                 f"Biological Age: {patient_payload.get('latest_bio_age')} | "
-                f"Delta: {patient_payload.get('latest_delta')}"
+                f"Delta: {patient_payload.get('latest_delta')} | "
+                f"Clinician: {patient_payload.get('clinician_name') or 'N/A'}"
             )
+
+            events = patient_payload.get("events", [])
+            if events:
+                from app.services.longitudinal import _format_date
+                event_lines = [
+                    f"- {_format_date(e.get('date', 'unknown'))}: {e.get('label', '')}"
+                    for e in sorted(events, key=lambda x: x.get("date", ""))
+                ]
+                context_parts.append(f"\n=== Patient Life Events ===\n" + "\n".join(event_lines))
+
             context_parts.append(f"\n=== Biomarkers ===\n{biomarker_str}")
             context_parts.append(f"\n=== Disease Risks ===\n{risk_str}")
             logger.info(f"Patient {patient_id} context parts: {context_parts}")
@@ -215,6 +257,35 @@ def build_context(
         else:
             logger.warning(f"No data found for patient {patient_id}")
             context_parts.append(f"No data found for patient {patient_id}.")
+
+    else:
+        # No patient selected — build population-level summary for cross-patient questions
+        all_patients = list_patients()
+        logger.info(f"No patient_id — building population context from {len(all_patients)} patients")
+        if all_patients:
+            context_parts.append("=== All Patients Summary ===")
+            for p in all_patients:
+                payload = p.get("payload", {})
+                delta = payload.get("latest_delta")
+                if delta is None:
+                    continue
+                try:
+                    aging_status = "aging faster" if float(delta) > 0 else "aging slower"
+                except Exception:
+                    aging_status = "unknown"
+                context_parts.append(
+                    f"Name: {_patient_display_name(payload)} | "
+                    f"Patient ID: {p['id']} | "
+                    f"SEQN: {payload.get('seqn')} | "
+                    f"Gender: {payload.get('gender')} | "
+                    f"Chron Age: {payload.get('latest_chron_age')} | "
+                    f"Bio Age: {payload.get('latest_bio_age')} | "
+                    f"Delta: {delta} | "
+                    f"Status: {aging_status}"
+                )
+            sources.append("all_patients")
+        else:
+            context_parts.append("No patients found in the database.")
 
     pc_hits = search_pc_knowledge(query_vector, pc_group=pc_group, limit=3)
     logger.info(f"PC knowledge hits: {len(pc_hits)}")
@@ -342,7 +413,7 @@ def rag_query(
         biomarkers, pcs = _extract_variables_with_llm(
             question,
             available,
-            lambda p: call_llm(p, temperature=0),
+            lambda p: call_llm(p),
         )
         # fallback: if keyword check fires but LLM returned nothing, use default vitals
         if not biomarkers and not pcs and is_longitudinal_question(question):
