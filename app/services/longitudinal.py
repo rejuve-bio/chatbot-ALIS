@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from typing import Optional
 
 from app.services.codebook import (
@@ -10,16 +11,36 @@ from app.services.llm_service import call_llm
 
 logger = logging.getLogger(__name__)
 
+
+def _format_date(date_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y")
+    except Exception:
+        return date_str
+
+
 LONGITUDINAL_SYSTEM_PROMPT = """
 You are a clinical assistant for the LinAge2 biological aging platform.
 
 Rules:
 - The data provided has already been fetched and verified. Always answer using it — never say data is unavailable.
-- When the data contains multiple time points (dates + values), present it as a Markdown table: | Date | Value | Change |
-- After the table, add one sentence summarizing the clinical trend (improving, worsening, stable) and magnitude.
-- For biological age questions, include a table of bio_age, chron_age, and delta per visit, then state the overall direction.
+- When the data contains multiple time points, present each biomarker as a section using this format:
+
+## Biomarker Name (CODE)
+- DATE: VALUE (CHANGE)
+- DATE: VALUE (CHANGE)
+Trend: one sentence on direction and magnitude.
+
+- For biological age questions use:
+
+## Biological Age Over Time
+- DATE: Bio Age = X | Chron Age = Y | Delta = Z
+Trend: one sentence on overall direction.
+
 - If only one data point exists, state the single value and note there is insufficient history to determine a trend.
 - Do not explain what measurements are. Do not give generic information.
+- Do not use pipe tables (|). Use ## headers and bullet points only.
 """
 
 
@@ -158,7 +179,7 @@ def _format_longitudinal_context(
                 rows = ["| Date | Value | Change |", "|---|---|---|"]
                 prev_val = None
                 for r in readings:
-                    date = r.get("date", "unknown date")
+                    date = _format_date(r.get("date", "unknown date"))
                     value = r.get("value", "N/A")
                     if prev_val is not None and isinstance(value, (int, float)) and isinstance(prev_val, (int, float)):
                         change = f"{value - prev_val:+.3f}"
@@ -177,7 +198,7 @@ def _format_longitudinal_context(
         parts.append("\n=== Biological Age Over Time ===")
         rows = ["| Date | Bio Age | Chron Age | Delta |", "|---|---|---|---|"]
         for cr in clock_results:
-            date = cr.get("date", "unknown")
+            date = _format_date(cr.get("date", "unknown"))
             bio_age = cr.get("bio_age", "N/A")
             chron_age = cr.get("chron_age", "N/A")
             delta = cr.get("delta", "N/A")
@@ -192,7 +213,7 @@ def _format_longitudinal_context(
         for pc_name, readings in pc_data.items():
             parts.append(f"\n{pc_name}:")
             for r in readings:
-                date = r.get("date", "unknown")
+                date = _format_date(r.get("date", "unknown"))
                 value = r.get("value", "N/A")
                 parts.append(f"  {date}: {value:+.4f}" if isinstance(value, float) else f"  {date}: {value}")
 
@@ -275,7 +296,7 @@ Clinical longitudinal data for patient analysis:
 {context}
 """
 
-    answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT)
+    answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True)
 
     sources = [f"longitudinal:{patient_id}"]
     for code in biomarkers:

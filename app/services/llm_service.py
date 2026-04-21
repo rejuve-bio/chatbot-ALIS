@@ -30,34 +30,37 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 def _clean_response(text: str) -> str:
-    """
-    Strip unintended markdown (headers, bold, bullets) while preserving
-    proper markdown table syntax so the frontend can render it.
-    """
     import re
     lines = text.strip().splitlines()
     cleaned = []
     for line in lines:
-        # preserve markdown table rows but strip bold/italic inside cells
         if re.match(r"^\s*\|", line):
             line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
             cleaned.append(line)
             continue
-        # strip leading markdown headers (#, ##, ###)
         line = re.sub(r"^#{1,6}\s*", "", line)
-        # strip bold/italic markers
         line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
-        # convert bullet/dash list items to plain lines
         line = re.sub(r"^\s*[-*]\s+", "", line)
-        # strip numbered list markers (1. 2. etc)
         line = re.sub(r"^\s*\d+\.\s+", "", line)
         cleaned.append(line)
-    # collapse multiple blank lines into one
     result = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned))
     return result.strip()
 
+def _fix_longitudinal_markdown(text: str) -> str:
+    import re
+    text = text.replace("\\n", "\n")
+    # ensure double newline before each ## section
+    text = re.sub(r'\n?(##\s)', r'\n\n\1', text)
+    # ensure double newline before each bullet
+    text = re.sub(r'\n?(-\s\d{4}-)', r'\n\n\1', text)
+    # ensure double newline before Trend:
+    text = re.sub(r'\n?(Trend:)', r'\n\n\1', text)
+    # collapse more than 2 consecutive newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
-def call_llm(prompt: str, system_prompt: str = None) -> str:
+
+def call_llm(prompt: str, system_prompt: str = None, raw_markdown: bool = False) -> str:
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -69,7 +72,10 @@ def call_llm(prompt: str, system_prompt: str = None) -> str:
         timeout=120.0
     )
     response.raise_for_status()
-    return _clean_response(response.json()["message"]["content"])
+    content = response.json()["message"]["content"]
+    if raw_markdown:
+        return _fix_longitudinal_markdown(content)
+    return _clean_response(content)
 
 
 def stream_llm(prompt: str, system_prompt: str = None):

@@ -29,8 +29,8 @@ FORMATTING:
 - For PC ranking questions: the context has a pre-built "PC Contributions Table" — output it as-is, then one sentence on the most urgent PC and why.
 - For biomarker driver questions: use the biomarker names and values from the context to build a | table (Code | Name | Patient Value | Interpretation), then one synthesis sentence.
 - For PC comparison questions: output a | table (Dimension | PC_A | PC_B), then one sentence on the key clinical difference.
-- When the context includes longitudinal time-series data: the context has pre-built "| Date | Value | Change |" tables — output them as-is, then one sentence on the clinical trend per biomarker.
-- For biological age trend questions: the context has a pre-built "| Date | Bio Age | Chron Age | Delta |" table — output it as-is, then state the overall direction.
+- When the context includes longitudinal time-series data: present each biomarker as ## Biomarker Name (CODE) followed by bullet points "- DATE: VALUE (CHANGE)", then one sentence on the clinical trend.
+- For biological age trend questions: use ## Biological Age Over Time with bullet points "- DATE: Bio Age = X | Chron Age = Y | Delta = Z", then state the overall direction.
 - For all other questions: answer in 3-5 sentences using only findings relevant to this patient's actual values.
 
 CLINICAL RULES:
@@ -337,12 +337,17 @@ def rag_query(
     # STEP 2: then ask LLM for variable extraction (after embed is done)
     biomarkers, pcs = [], []
     if patient_id:
+        from app.services.codebook import is_longitudinal_question
         available = get_force_included_variables()
         biomarkers, pcs = _extract_variables_with_llm(
             question,
             available,
-            lambda p: call_llm(p),
+            lambda p: call_llm(p, temperature=0),
         )
+        # fallback: if keyword check fires but LLM returned nothing, use default vitals
+        if not biomarkers and not pcs and is_longitudinal_question(question):
+            logger.warning("LLM extraction returned empty but question looks longitudinal — using default vitals")
+            biomarkers = ["BPXSAR", "BPXDAR", "BPXPLS"]
 
     needs_longitudinal = bool(biomarkers or pcs)
     logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
@@ -376,7 +381,7 @@ def rag_query(
             )
             sources.append(f"longitudinal:{patient_id}")
             prompt = build_prompt(question, long_context)
-            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT)
+            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True)
             return answer, sources
 
     prompt = build_prompt(question, context)
