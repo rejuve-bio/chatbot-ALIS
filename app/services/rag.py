@@ -10,7 +10,7 @@ from app.services.qdrant_service import (
     upsert_patient,list_patients
 )
 
-from app.services.alis_api import fetch_patient,fetch_longitudinal
+from app.services.alis_api import fetch_patient, fetch_longitudinal, fetch_all_patients
 from app.services.parsers.excel_parser import parse_excel
 from app.services.parsers.pdf_parser import parse_pdf
 from app.services.llm_service import embed_batch
@@ -71,7 +71,10 @@ def build_patient_text_summary(data: dict) -> str:
     chron_age = data.get("latest_chron_age", "N/A")
     bio_age = data.get("latest_bio_age", "N/A")
     delta = data.get("latest_delta", "N/A")
-    aging_status = "aging faster than normal" if delta and float(delta) > 0 else "aging slower than normal"
+    try:
+        aging_status = "aging faster than normal" if delta not in (None, "N/A") and float(delta) > 0 else "aging slower than normal"
+    except (ValueError, TypeError):
+        aging_status = "unknown"
 
     heatmap_data = data.get("latest_heatmap", {})
     heatmap_rows = heatmap_data.get("rows", [])
@@ -162,34 +165,18 @@ def build_context(
     patient_payload = None
 
     if patient_id:
-        patient_payload = search_patient(patient_id, query_vector)
-        logger.info(f"Qdrant search result for {patient_id}: {'found' if patient_payload else 'not found'}")
-
-        if not patient_payload:
-            existing = list_patients()
-            if not existing:
-                logger.info("Collection empty — bulk ingesting all patients...")
-                from app.services.alis_api import fetch_all_patients
-                all_patients = fetch_all_patients(token=token)
-                for p in all_patients:
-                    pid = p.get("id")
-                    if pid:
-                        fetch_and_store_patient(pid, token=token)
-                # now try search again
-                patient_payload = search_patient(patient_id, query_vector)
-
-            # if still not found fetch just this one
-            if not patient_payload:
-                logger.info(f"Patient {patient_id} not in Qdrant — fetching from ALIS API")
+        # Always try the ALIS API first — fresh data, and stores result in Qdrant as a side effect
+        if token:
+            try:
                 patient_payload = fetch_and_store_patient(patient_id, token=token)
+                logger.info(f"Patient {patient_id} fetched fresh from ALIS API")
+            except Exception as e:
+                logger.warning(f"ALIS API unavailable for {patient_id}: {e} — falling back to Qdrant")
 
-        # stale record — missing any field added after initial ingest — refresh silently
-        new_fields = {"events", "first_name", "last_name", "clinician_name"}
-        if patient_payload and not new_fields.issubset(patient_payload.keys()) and token:
-            logger.info(f"Patient {patient_id} has stale record (missing new fields) — refreshing from ALIS API")
-            refreshed = fetch_and_store_patient(patient_id, token=token)
-            if refreshed:
-                patient_payload = refreshed
+        # Fall back to Qdrant cache if API failed or no token
+        if not patient_payload:
+            patient_payload = search_patient(patient_id, query_vector)
+            logger.info(f"Qdrant cache for {patient_id}: {'hit' if patient_payload else 'miss'}")
                 
         if patient_payload:
             from app.services.codebook import get_label
@@ -259,13 +246,46 @@ def build_context(
             context_parts.append(f"No data found for patient {patient_id}.")
 
     else:
-        # No patient selected — build population-level summary for cross-patient questions
-        all_patients = list_patients()
-        logger.info(f"No patient_id — building population context from {len(all_patients)} patients")
-        if all_patients:
+        # No patient selected — population-level summary
+        # Primary: fetch clinic patients from API (always fresh + clinic-filtered by token)
+        # Fallback: Qdrant cache if API is unavailable
+        api_available = False
+        clinic_ids: set[str] = set()
+        qdrant_map: dict[str, dict] = {}
+
+        if token:
+            try:
+                clinic_items = fetch_all_patients(token=token)
+                clinic_ids = {p.get("id") for p in clinic_items if p.get("id")}
+                api_available = True
+                logger.info(f"Fetched {len(clinic_ids)} clinic patients from API")
+            except Exception as e:
+                logger.warning(f"ALIS API unavailable for population query: {e} — falling back to Qdrant")
+
+        # Build Qdrant map (used either as fallback or to fill gaps)
+        qdrant_patients = list_patients()
+        qdrant_map = {p["id"]: p.get("payload", {}) for p in qdrant_patients}
+
+        if api_available and clinic_ids:
+            # Refresh all clinic patients from API so population data is always current
+            for pid in clinic_ids:
+                try:
+                    payload = fetch_and_store_patient(pid, token=token)
+                    if payload:
+                        qdrant_map[pid] = payload
+                except Exception as e:
+                    logger.warning(f"Population: could not refresh patient {pid}: {e}")
+            display_ids = clinic_ids
+        else:
+            # API down — use everything in Qdrant
+            display_ids = qdrant_map.keys()
+
+        logger.info(f"No patient_id — building population context from {len(display_ids)} patients")
+
+        if display_ids:
             context_parts.append("=== All Patients Summary ===")
-            for p in all_patients:
-                payload = p.get("payload", {})
+            for pid in display_ids:
+                payload = qdrant_map.get(pid, {})
                 delta = payload.get("latest_delta")
                 if delta is None:
                     continue
@@ -275,7 +295,7 @@ def build_context(
                     aging_status = "unknown"
                 context_parts.append(
                     f"Name: {_patient_display_name(payload)} | "
-                    f"Patient ID: {p['id']} | "
+                    f"Patient ID: {pid} | "
                     f"SEQN: {payload.get('seqn')} | "
                     f"Gender: {payload.get('gender')} | "
                     f"Chron Age: {payload.get('latest_chron_age')} | "
