@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from app.services.llm_service import embed_text, call_llm, stream_llm
 from app.services.qdrant_service import (
     search_patient, search_pc_knowledge,
-    upsert_patient,list_patients
+    upsert_patient, list_patients, get_patient_count
 )
 
 from app.services.alis_api import fetch_patient, fetch_longitudinal, fetch_all_patients
@@ -150,6 +150,25 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
     return payload
 
 
+def populate_all_patients(token: str) -> dict[str, dict]:
+    """Bulk-populate Qdrant with all patients from /patients. Returns pid -> payload map."""
+    logger.info("Patient collection is empty — bulk-fetching all patients from /patients")
+    all_items = fetch_all_patients(token=token)
+    results: dict[str, dict] = {}
+    for item in all_items:
+        pid = item.get("id")
+        if not pid:
+            continue
+        try:
+            payload = fetch_and_store_patient(pid, token=token)
+            if payload:
+                results[pid] = payload
+        except Exception as e:
+            logger.warning(f"populate_all_patients: failed for {pid}: {e}")
+    logger.info(f"Bulk population complete — {len(results)} patients stored in Qdrant")
+    return results
+
+
 def build_context(
     question: str,
     patient_id: Optional[str] = None,
@@ -165,19 +184,26 @@ def build_context(
     patient_payload = None
 
     if patient_id:
-        # Always try the ALIS API first — fresh data, and stores result in Qdrant as a side effect
         if token:
-            try:
-                patient_payload = fetch_and_store_patient(patient_id, token=token)
-                logger.info(f"Patient {patient_id} fetched fresh from ALIS API")
-            except Exception as e:
-                logger.warning(f"ALIS API unavailable for {patient_id}: {e} — falling back to Qdrant")
+            if get_patient_count() == 0:
+                # First ever patient query — bulk-populate all patients to seed Qdrant,
+                # then use this patient's result directly (avoids a second API call)
+                logger.info("Patient collection is empty — bulk-populating all patients from /patients")
+                all_payloads = populate_all_patients(token)
+                patient_payload = all_payloads.get(patient_id)
+            else:
+                # Collection already seeded — always fetch fresh for this specific patient
+                try:
+                    patient_payload = fetch_and_store_patient(patient_id, token=token)
+                    logger.info(f"Patient {patient_id} fetched fresh from ALIS API")
+                except Exception as e:
+                    logger.warning(f"ALIS API unavailable for {patient_id}: {e} — falling back to Qdrant")
 
-        # Fall back to Qdrant cache if API failed or no token
+        # Fallback: Qdrant cache (no token, or API was down)
         if not patient_payload:
             patient_payload = search_patient(patient_id, query_vector)
-            logger.info(f"Qdrant cache for {patient_id}: {'hit' if patient_payload else 'miss'}")
-                
+            logger.info(f"Qdrant fallback for {patient_id}: {'hit' if patient_payload else 'miss'}")
+       
         if patient_payload:
             from app.services.codebook import get_label
             

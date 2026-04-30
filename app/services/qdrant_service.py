@@ -22,6 +22,18 @@ logger.info(f"Connecting to Qdrant at {QDRANT_URL}")
 client = QdrantClient(url=QDRANT_URL)
 
 
+def _populate_pc_collection():
+    try:
+        from datas.pc_chunks import PC_CHUNKS
+        from app.services.llm_service import embed_batch
+        texts = [chunk["raw_text"] for chunk in PC_CHUNKS]
+        vectors = embed_batch(texts)
+        upsert_pc_chunks(PC_CHUNKS, vectors)
+        logger.info(f"PC collection auto-populated with {len(PC_CHUNKS)} chunks")
+    except Exception as e:
+        logger.error(f"Failed to auto-populate PC collection: {e}")
+
+
 def init_collections():
     logger.info("Initializing Qdrant collections")
     existing = [c.name for c in client.get_collections().collections]
@@ -43,6 +55,17 @@ def init_collections():
         logger.info(f"Created collection: {PC_COLLECTION}")
     else:
         logger.info(f"Collection already exists: {PC_COLLECTION}")
+
+    pc_count = client.count(collection_name=PC_COLLECTION).count
+    if pc_count == 0:
+        logger.info("PC collection is empty — auto-populating from built-in chunks")
+        _populate_pc_collection()
+    else:
+        logger.info(f"PC collection already has {pc_count} points — skipping population")
+
+
+def get_patient_count() -> int:
+    return client.count(collection_name=PATIENT_COLLECTION).count
 
 
 def upsert_patient(patient_uuid: str, text_summary: str, vector: list[float], payload: dict):
