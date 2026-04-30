@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 QDRANT_URL = os.getenv("QDRANT_HOST", "http://localhost:6333")
 PATIENT_COLLECTION = os.getenv("PATIENT_COLLECTION", "patient_data")
 PC_COLLECTION = os.getenv("PC_COLLECTION", "pc_knowledge")
-VECTOR_SIZE = 768
+VECTOR_SIZE = 1024
 
 logger.info(f"Connecting to Qdrant at {QDRANT_URL}")
 client = QdrantClient(url=QDRANT_URL)
