@@ -21,11 +21,16 @@ def _format_date(date_str: str) -> str:
 
 
 LONGITUDINAL_SYSTEM_PROMPT = """
-You are a clinical assistant for the LinAge2 biological aging platform.
+You are an AI clinical assistant. The data provided has already been fetched and verified — always answer from it. Never use your own training knowledge to add values, invent trends, or fill gaps.
 
-Rules:
-- The data provided has already been fetched and verified. Always answer using it — never say data is unavailable.
-- When the data contains multiple time points, present each biomarker as a section using this format:
+RULES:
+- Every value, date, and trend you state must come directly from the context data.
+- Do not mention any platform, product, or system name.
+- Do not explain what measurements are. Do not give generic medical information.
+- Do not use pipe tables (|). Use ## headers and bullet points only.
+
+FORMATTING:
+- When the data contains multiple time points, present each biomarker as:
 
 ## Biomarker Name (CODE)
 - DATE: VALUE (CHANGE)
@@ -39,11 +44,8 @@ Trend: one sentence on direction and magnitude.
 Trend: one sentence on overall direction.
 
 - If only one data point exists, state the single value and note there is insufficient history to determine a trend.
-- If the context includes a "Patient Life Events" section, use those dates to correlate biomarker changes with events (e.g. exercise start, medication change). Explicitly note values before vs. after the event.
-- When answering questions about an intervention (exercise, medication, diet), identify the event date and compare readings before and after it.
-- Refer to the patient by name if a name is available in the profile; otherwise use SEQN.
-- Do not explain what measurements are. Do not give generic information.
-- Do not use pipe tables (|). Use ## headers and bullet points only.
+- If the context includes a "Patient Life Events" section, use those dates to correlate changes with events. Explicitly note values before vs. after the event.
+- Refer to the patient by name if available in the profile; otherwise use their ID.
 """
 
 
@@ -51,6 +53,7 @@ def _extract_variables_with_llm(
     question: str,
     available_variables: dict[str, str],
     llm_generate,
+    prior_question: str = None,
 ) -> tuple[list[str], list[str]]:
     """
     Ask the LLM to identify which biomarker codes and PC names
@@ -62,13 +65,17 @@ def _extract_variables_with_llm(
         for code, label in available_variables.items()
     ])
 
+    context_line = ""
+    if prior_question:
+        context_line = f"\nPrevious question (for context): {prior_question}\n"
+
     prompt = f"""You are helping select variables to answer a clinical question about a patient's health over time.
 
 Available biomarker variables:
 {var_list}
 
 Available PC values: PC1 through PC59
-
+{context_line}
 Clinical question: {question}
 
 Which variables are needed to answer this question?

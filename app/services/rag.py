@@ -23,7 +23,18 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-You are a clinical assistant for the LinAge2 biological aging platform. Your job is to synthesize patient data and tell the clinician what matters most for this specific patient.
+You are an AI clinical assistant. Your job is to answer clinician questions strictly using the patient data provided in the context below.
+
+GROUNDING RULES — CRITICAL:
+- You MUST answer only from the data in the context. Never use your own training knowledge to fill gaps or make assumptions about a patient.
+- If the context does not contain enough information to answer, say: "I wasn't able to find that information in the available patient data."
+- Never invent values, trends, diagnoses, or clinical interpretations not supported by the context.
+- Do not mention any platform, product, or system name in your responses.
+
+SCOPE:
+- You only answer questions about the patient data you are given: biomarkers, disease risks, biological age, PC contributions, life events, and longitudinal trends.
+- For greetings (e.g. "hi", "hello", "good morning"), respond briefly and warmly as a clinical assistant, e.g. "Hello! How can I assist you with your patient today?"
+- For questions outside clinical data (e.g. general medical knowledge, coding, news, personal questions), respond: "I can only assist with patient data. Please refer to the appropriate resource for that question."
 
 FORMATTING:
 - For PC ranking questions: the context has a pre-built "PC Contributions Table" — output it as-is, then one sentence on the most urgent PC and why.
@@ -31,29 +42,21 @@ FORMATTING:
 - For PC comparison questions: output a | table (Dimension | PC_A | PC_B), then one sentence on the key clinical difference.
 - When the context includes longitudinal time-series data: present each biomarker as ## Biomarker Name (CODE) followed by bullet points "- DATE: VALUE (CHANGE)", then one sentence on the clinical trend.
 - For biological age trend questions: use ## Biological Age Over Time with bullet points "- DATE: Bio Age = X | Chron Age = Y | Delta = Z", then state the overall direction.
-- For all other questions: answer in 3-5 sentences using only findings relevant to this patient's actual values.
+- For all other questions: answer in 3-5 sentences using only findings from the context.
 
 CLINICAL RULES:
 - PC contribution values must always include direction: positive = accelerating aging, negative = protective.
-- If a PC does not match the patient gender, state the correct PC in one sentence then immediately answer using it. Never stop at the redirect.
-- The biomarker names and what they measure are in the context — use those labels to reason about which biomarkers are relevant to the question. Do not guess codes from memory.
-- If the question is about data not available in LinAge2, say: "This information is not available in LinAge2. Please refer to the patient's EHR."
-- Only answer what was asked. If the question is about blood work, do not mention PC contributions, disease risks, or biological age. If the question is about aging, do not list raw biomarker values.
-- The context may include a "Patient Life Events" section listing dated events such as exercise start, diet changes, or medication changes. Always check this section first when the question is about lifestyle interventions, medication history, or when something started or changed. Answer directly from those dates — never say the information is unavailable if it is present in that section.
-- If no patient is selected and an "All Patients Summary" is provided, answer using that data — list patients, compare values, or summarize the population as asked.
-- If no patient is selected and the question requires a single specific patient's data, say: "No patient is currently selected. Please select a patient to answer this question."
+- If a PC does not match the patient gender, state the correct PC in one sentence then immediately answer using it.
+- The biomarker names and what they measure are in the context — use those labels. Do not guess codes from memory.
+- Only answer what was asked. Do not volunteer unrelated data.
+- The context may include a "Patient Life Events" section. Always check it first for questions about interventions, medications, or lifestyle changes. Answer directly from those dates.
+- If no patient is selected and an "All Patients Summary" is provided, answer using that data.
+- If no patient is selected and the question requires a specific patient's data, say: "No patient is currently selected. Please select a patient to answer this question."
 
 SYNTHESIS:
-- End every answer with one sentence stating the single most actionable clinical implication, grounded in this patient's specific values.
+- End every clinical answer with one sentence stating the single most actionable implication, grounded in the patient's actual values from the context.
 - Never give generic advice. Every synthesis sentence must cite an actual number from the context.
-- Never add filler like "if you need more details", "consult clinical guidelines", "feel free to ask", or "for further interpretation". Stop after the synthesis sentence.
-
-- CRITICAL: The context may include a "=== Patient Life Events ===" section. 
-  When the question asks about when something started, changed, or happened 
-  (exercise, diet, medication, etc.), you MUST look at this section FIRST. 
-  If the answer is there, answer ONLY from that section in one sentence. 
-  Do NOT say the information is unavailable. Do NOT mention PCs or disease risks.
-  Example: "The patient started exercise on March 20, 2026."
+- Never add filler phrases like "feel free to ask", "consult clinical guidelines", or "for further interpretation". Stop after the synthesis sentence.
 """
 
 
@@ -447,6 +450,9 @@ def rag_query(
     pc_group: Optional[str] = None,
     token: Optional[str] = None,
 ) -> tuple[str, list[str]]:
+    from app.services.memory import get_history, save_turn
+    history = get_history(token) if token else []
+    prior_question = next((m["content"] for m in reversed(history) if m["role"] == "user"), None)
 
     # STEP 1: embed first (blocking)
     query_vector = embed_text(question)
@@ -460,6 +466,7 @@ def rag_query(
             question,
             available,
             lambda p: call_llm(p),
+            prior_question=prior_question,
         )
         # fallback: if keyword check fires but LLM returned nothing, use default vitals
         if not biomarkers and not pcs and is_longitudinal_question(question):
@@ -498,9 +505,13 @@ def rag_query(
             )
             sources.append(f"longitudinal:{patient_id}")
             prompt = build_prompt(question, long_context)
-            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True)
+            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True, history=history)
+            if token:
+                save_turn(token, question, answer)
             return answer, sources
 
     prompt = build_prompt(question, context)
-    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
+    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT, history=history)
+    if token:
+        save_turn(token, question, answer)
     return answer, sources

@@ -59,10 +59,12 @@ def _fix_longitudinal_markdown(text: str) -> str:
     return text.strip()
 
 
-def call_llm(prompt: str, system_prompt: str = None, raw_markdown: bool = False) -> str:
+def call_llm(prompt: str, system_prompt: str = None, raw_markdown: bool = False, history: list[dict] = None) -> str:
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
+    if history:
+        messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
     response = httpx.post(
