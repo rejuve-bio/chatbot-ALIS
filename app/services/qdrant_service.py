@@ -24,7 +24,7 @@ client = QdrantClient(url=QDRANT_URL)
 
 def _populate_pc_collection():
     try:
-        from datas.pc_chunks import PC_CHUNKS
+        from data.pc_chunks import PC_CHUNKS
         from app.services.llm_service import embed_batch
         texts = [chunk["raw_text"] for chunk in PC_CHUNKS]
         vectors = embed_batch(texts)
