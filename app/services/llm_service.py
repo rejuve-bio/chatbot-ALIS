@@ -33,19 +33,8 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
 
 def _clean_response(text: str) -> str:
     import re
-    lines = text.strip().splitlines()
-    cleaned = []
-    for line in lines:
-        if re.match(r"^\s*\|", line):
-            line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
-            cleaned.append(line)
-            continue
-        line = re.sub(r"^#{1,6}\s*", "", line)
-        line = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", line)
-        line = re.sub(r"^\s*[-*]\s+", "", line)
-        line = re.sub(r"^\s*\d+\.\s+", "", line)
-        cleaned.append(line)
-    result = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned))
+    text = text.replace("\\n", "\n")
+    result = re.sub(r"\n{3,}", "\n\n", text.strip())
     return result.strip()
 
 

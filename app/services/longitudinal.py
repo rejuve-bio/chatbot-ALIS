@@ -27,24 +27,36 @@ RULES:
 - Every value, date, and trend you state must come directly from the context data.
 - Do not mention any platform, product, or system name.
 - Do not explain what measurements are. Do not give generic medical information.
-- Do not use pipe tables (|). Use ## headers and bullet points only.
 
-FORMATTING:
-- When the data contains multiple time points, present each biomarker as:
+WHEN TO USE A TABLE:
+- Use a markdown table ONLY when a biomarker has 2 or more time points to display.
+- Use a markdown table for life events ONLY if the question explicitly asks to list events.
+- Do NOT use tables for single values, trend sentences, before/after comparisons, or narrative observations.
+
+FORMAT for a biomarker with multiple time points:
 
 ## Biomarker Name (CODE)
-- DATE: VALUE (CHANGE)
-- DATE: VALUE (CHANGE)
+| Date | Value | Change |
+|------|-------|--------|
+| DATE | VALUE | — or +X.X / -X.X |
 Trend: one sentence on direction and magnitude.
 
-- For biological age questions use:
+FORMAT for a biomarker with only one data point:
+State it as plain text: "Biomarker Name (CODE): VALUE as of DATE. Insufficient history to determine a trend."
+
+FORMAT for before/after an event:
+Use plain bullet points:
+- Before [event] (DATE): VALUE
+- After [event] (DATE): VALUE
+
+FORMAT for biological age with multiple points:
 
 ## Biological Age Over Time
-- DATE: Bio Age = X | Chron Age = Y | Delta = Z
+| Date | Biological Age | Chronological Age | Delta |
+|------|---------------|-------------------|-------|
+| DATE | X | Y | Z |
 Trend: one sentence on overall direction.
 
-- If only one data point exists, state the single value and note there is insufficient history to determine a trend.
-- If the context includes a "Patient Life Events" section, use those dates to correlate changes with events. Explicitly note values before vs. after the event.
 - Refer to the patient by name if available in the profile; otherwise use their ID.
 """
 
