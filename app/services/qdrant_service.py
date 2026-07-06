@@ -124,6 +124,27 @@ def upsert_pc_chunks(chunks: list[dict], vectors: list[list[float]]):
     logger.info(f"Upserted {len(points)} PC knowledge chunks successfully")
 
 
+def upsert_patient_chunks(chunks: list[dict], vectors: list[list[float]]):
+    logger.info(f"Upserting {len(chunks)} patient biomarker chunks")
+    points = []
+    for chunk, vector in zip(chunks, vectors):
+        points.append(PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vector,
+            payload={
+                "patient_id": chunk["patient_id"],
+                "param_code": chunk.get("param_code"),
+                "param_name": chunk.get("param_name"),
+                "reference_range": chunk.get("reference_range"),
+                "readings": chunk.get("readings", {}),
+                "pc_group": chunk.get("pc_group"),
+                "text_summary": chunk.get("text_summary", "")
+            }
+        ))
+    client.upsert(collection_name=PATIENT_COLLECTION, points=points)
+    logger.info(f"Upserted {len(points)} patient biomarker chunks successfully")
+
+
 def search_pc_knowledge(query_vector: list[float], pc_group: str = None, limit: int = 3) -> list[dict]:
     logger.info(f"Searching PC knowledge | pc_group filter: {pc_group}")
     search_filter = None
