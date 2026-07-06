@@ -1,6 +1,5 @@
 import hashlib
 from collections import deque
-from typing import Optional
 
 # user_key -> deque of (question, answer) tuples, max 3 entries
 _store: dict[str, deque] = {}

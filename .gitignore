@@ -1,5 +1,6 @@
 .env
 venv/
 *.txt
+__pycache__/
 datas
 data

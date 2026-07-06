@@ -1,13 +1,13 @@
 import httpx
-import json
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 EMBEDDING_HOST = os.getenv("EMBEDDING_HOST", "http://202.181.159.222:11434")
-LLM_HOST = os.getenv("LLM_HOST", "http://202.181.159.222:8001")
+LLM_HOST = os.getenv("LLM_HOST", "http://202.181.159.222:8002")
 LLM_MODEL = os.getenv("LLM_MODEL")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 EMBEDDING_MODEL = "mxbai-embed-large"
 
 
@@ -56,8 +56,10 @@ def call_llm(prompt: str, system_prompt: str = None, raw_markdown: bool = False,
         messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
     response = httpx.post(
         f"{LLM_HOST}/v1/chat/completions",
+        headers=headers,
         json={"model": LLM_MODEL, "messages": messages, "stream": False},
         timeout=120.0
     )
@@ -66,26 +68,3 @@ def call_llm(prompt: str, system_prompt: str = None, raw_markdown: bool = False,
     if raw_markdown:
         return _fix_longitudinal_markdown(content)
     return _clean_response(content)
-
-
-def stream_llm(prompt: str, system_prompt: str = None):
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    with httpx.stream(
-        "POST",
-        f"{LLM_HOST}/v1/chat/completions",
-        json={"model": LLM_MODEL, "messages": messages, "stream": True},
-        timeout=120.0
-    ) as response:
-        for line in response.iter_lines():
-            if line.startswith("data: "):
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                chunk = json.loads(data)
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    yield delta
