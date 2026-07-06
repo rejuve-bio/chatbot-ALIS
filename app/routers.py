@@ -1,14 +1,12 @@
 
 import logging
-from fastapi import APIRouter, Form, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Form, HTTPException, UploadFile, File, Header
 from typing import Optional
 
 from app.schema import ChatResponse, HealthCheckResponse
-from app.services.rag import rag_query, rag_query_stream, ingest_excel, ingest_pdf, fetch_and_store_patient
+from app.services.rag import rag_query, ingest_excel, ingest_pdf, fetch_and_store_patient
 from app.services.qdrant_service import list_patients, check_qdrant_health
 from app.services.llm_service import embed_text
-from fastapi import APIRouter, Form, HTTPException, UploadFile, File, Header
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +45,7 @@ async def resync_patients(authorization: str = Header(None)):
     """Re-fetch all patients from ALIS API and update Qdrant with latest data (names, events, biomarkers)."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header is required")
-    from app.services.alis_api import fetch_all_patients
+    from app.services.backend_api import fetch_all_patients
     patients = fetch_all_patients(token=authorization)
     if not patients:
         raise HTTPException(status_code=502, detail="No patients returned from ALIS API")
@@ -71,35 +69,19 @@ async def chat(
     message: str = Form(...),
     patient_id: Optional[str] = Form(None),
     pc_group: Optional[str] = Form(None),
-    stream: Optional[bool] = Form(False),
     authorization = Header(None)
 ):
-
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header is required")
 
     logger.info(f"Chat request | patient_id: {patient_id} | pc_group: {pc_group} | message: {message}")
 
-    # if stream:
-    #     logger.info("Streaming response requested")
-    #     generator, sources = rag_query_stream(
-    #         question=message,
-    #         patient_id=patient_id,
-    #         pc_group=pc_group,
-    #     )
-    #     def event_stream():
-    #         for chunk in generator:
-    #             yield chunk
-    #     return StreamingResponse(event_stream(), media_type="text/plain")
-    logger.info(f"Authorization header received: {authorization}")
-    logger.info(f"Question is {message} with patient id {patient_id}")
     answer, sources = rag_query(
         question=message,
         patient_id=patient_id,
         pc_group=pc_group,
-        token = authorization
+        token=authorization
     )
-
 
     logger.info(f"Chat response generated | sources: {sources} and the response is {answer}")
     return ChatResponse(answer=answer, sources=sources)

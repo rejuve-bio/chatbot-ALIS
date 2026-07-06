@@ -1,12 +1,13 @@
 import logging
 from datetime import datetime
-from typing import Optional
 
 from app.services.codebook import (
     get_label,
+    decode_questionnaire_value,
+    is_questionnaire,
     get_force_included_variables,
 )
-from app.services.alis_api import fetch_longitudinal
+from app.services.backend_api import fetch_longitudinal
 from app.services.llm_service import call_llm
 
 logger = logging.getLogger(__name__)
@@ -100,11 +101,14 @@ Reply with ONLY a JSON object in this exact format, nothing else:
 
 Rules:
 - Only include variables directly relevant to the question
-- For questions about blood work, biomarkers, or lab results: include only biomarker codes, leave pcs as empty list
+- DIAGNOSIS/HISTORY QUESTIONS: If the question asks whether the patient was diagnosed with, told they have, or has a history of a condition (e.g. "does this patient have asthma", "has the patient been told they have hypertension", "does the patient have diabetes") — return EMPTY lists for both biomarkers and pcs. These are questionnaire lookups, not time-series questions.
+- PC RANKING QUESTIONS: If the question asks which PCs are highest, lowest, top, most significant, or asks to rank/list a patient's PCs without specifying which ones (e.g. "get me the highest three PCs", "what are the top PCs", "which PC contributes the most") — return EMPTY lists. PC contribution rankings already exist in the patient profile.
+- For questions about trends, changes over time, longitudinal patterns, or "how has X changed": include the relevant biomarker codes
+- For questions about blood work, lab results, or a specific current value: include only biomarker codes, leave pcs as empty list
 - For questions about aging, delta, biological age, or clock results: leave both biomarkers and pcs as empty lists — those come from clock_results automatically
-- For questions explicitly about a specific PC (e.g. "how has PC1 changed"): include it in pcs, leave biomarkers empty
-- If unsure, include the most likely biomarker variable rather than leaving it empty
-- Maximum 5 biomarker codes
+- For questions explicitly about how a SPECIFIC named PC has changed over time (e.g. "how has PC1 changed", "show PC32 trend"): include ONLY that named PC in pcs, leave biomarkers empty
+- If genuinely unsure whether a question needs time-series data, return empty lists — the regular patient context handles single-value lookups
+- Maximum 5 biomarker codes, maximum 5 PC codes — never list all PCs
 """
 
     try:
@@ -198,6 +202,22 @@ def _format_longitudinal_context(
             parts.append("\n=== Patient Life Events ===")
             for e in sorted(events, key=lambda x: x.get("date", "")):
                 parts.append(f"- {_format_date(e.get('date', 'unknown'))}: {e.get('label', '')}")
+
+    # questionnaire snapshot — always include so LLM can answer diagnosis questions
+    # even when this function is reached via longitudinal path
+    if patient_payload:
+        biomarkers_snap = patient_payload.get("biomarkers", {})
+        q_lines = []
+        for k, v in biomarkers_snap.items():
+            if not is_questionnaire(k):
+                continue
+            raw = v.get("value") if isinstance(v, dict) else v
+            if raw is None:
+                q_lines.append(f"{get_label(k)}: Not answered")
+                continue
+            q_lines.append(f"{get_label(k)}: {decode_questionnaire_value(k, raw)}")
+        if q_lines:
+            parts.append("\n=== Patient Questionnaire (Medical History) ===\n" + "\n".join(q_lines))
 
     # biomarker time series — pre-built as markdown tables
     biomarker_data = data.get("biomarkers", {})
@@ -308,8 +328,8 @@ def answer_longitudinal_question(
 
     if not data:
         return (
-            f"I was unable to retrieve longitudinal data for this patient. "
-            f"The ALIS API did not return any time series data.",
+            "I was unable to retrieve longitudinal data for this patient. "
+            "The ALIS API did not return any time series data.",
             []
         )
 

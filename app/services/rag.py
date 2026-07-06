@@ -1,22 +1,27 @@
 
-import os
+import re
 import logging
 from typing import Optional
 from dotenv import load_dotenv
 
-from app.services.llm_service import embed_text, call_llm, stream_llm
+from app.services.llm_service import embed_text, embed_batch, call_llm
 from app.services.qdrant_service import (
     search_patient, search_pc_knowledge,
-    upsert_patient, list_patients, get_patient_count
+    upsert_patient, list_patients, get_patient_count,
+    upsert_pc_chunks,
 )
-
-from app.services.alis_api import fetch_patient, fetch_longitudinal, fetch_all_patients
+from app.services.backend_api import fetch_patient, fetch_longitudinal, fetch_all_patients, fetch_biomarker_data_latest
 from app.services.parsers.excel_parser import parse_excel
 from app.services.parsers.pdf_parser import parse_pdf
-from app.services.llm_service import embed_batch
-from app.services.qdrant_service import upsert_pc_chunks    
-from app.services.longitudinal import _extract_variables_with_llm, _format_longitudinal_context
-from app.services.codebook import get_force_included_variables
+from app.services.longitudinal import (
+    _extract_variables_with_llm, _format_longitudinal_context,
+    _format_date, LONGITUDINAL_SYSTEM_PROMPT,
+)
+from app.services.codebook import (
+    get_force_included_variables, get_label, decode_questionnaire_value,
+    is_questionnaire, DEMOGRAPHIC_CODES, is_longitudinal_question,
+)
+from app.services.memory import get_history, save_turn
 
 load_dotenv()
 
@@ -32,7 +37,7 @@ GROUNDING — CRITICAL:
 
 PATIENT SELECTION RULES — read this before answering anything:
 - The context will either contain a single patient's data OR an "All Patients Summary".
-- If the context is "All Patients Summary": only answer population questions (who is aging fastest, compare patients, list all patients). For anything else, respond: "Please select a specific patient or provide a patient name, ID, or SEQN to view their [biomarkers / heart rate / PC scores / etc.]."
+- If the context is "All Patients Summary": answer population questions (who is aging fastest, compare patients, list all patients, most common/significant PCs across all subjects, which PC appears most often, rank PCs by contribution across patients). For anything else that requires a single patient's full record, respond: "Please select a specific patient or provide a patient name, ID, or SEQN to view their [biomarkers / heart rate / PC scores / etc.]."
 - If a patient IS selected but their data does not contain what was asked: respond "I wasn't able to find that information in this patient's data."
 - Never say "I wasn't able to find that information" when no patient is selected — that response is only for when a patient IS selected.
 
@@ -43,7 +48,8 @@ SCOPE:
 FORMATTING — use the simplest format that fits:
 - Single value or direct fact: one or two plain sentences. No table.
 - Multiple values side by side (PC rankings, biomarker comparison, patient list): markdown table.
-- PC ranking: output the pre-built PC Contributions Table as-is, then one sentence on the most urgent PC.
+- PC ranking (single patient): if the question asks for a specific number of PCs (e.g. "top 3", "highest 3", "three"), show only that many rows from the PC Contributions Table sorted by absolute contribution. Otherwise output the full table. End with one sentence on the most urgent PC.
+- PC ranking (population / All Patients Summary): aggregate PCs across all patients by summing absolute contributions or counting frequency. If the question specifies a number (e.g. "3 most significant"), return ONLY that many rows — no more. Always end with one sentence on the top-ranked PC.
 - PC comparison (e.g. PC1M vs PC1F): markdown table (| Dimension | PC_A | PC_B |).
 - Life events: only use a table if the clinician explicitly asks to list events; otherwise mention them inline.
 - Separate sections: use ## headers. Lists of observations: use bullet points.
@@ -54,6 +60,9 @@ CLINICAL RULES:
 - Use biomarker names and labels from the context. Do not guess codes.
 - Answer only what was asked. Do not volunteer unrelated data.
 - Check "Patient Life Events" first for any question about interventions, medications, or lifestyle changes.
+- Questionnaire answers appear in the Biomarkers section with Yes/No values. Use these to answer questions about medical history (hypertension, diabetes, smoking, fractures, etc.).
+- When asked about a condition (e.g. "does this patient have hypertension"), look for the relevant questionnaire variable in the Biomarkers section and answer from it directly.
+- If the Biomarkers section has no questionnaire answer for the condition asked, check the Disease Risks section — if the condition appears there with an evidence score, report it (e.g. "The questionnaire data does not confirm this, but Hypertension is listed as a top disease risk with an evidence score of 9.9").
 
 SYNTHESIS:
 - End every clinical answer with one sentence on the single most actionable implication, citing an actual number from the context.
@@ -124,6 +133,16 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
     heatmap = data.get("latest_heatmap", {})
     label_to_human = {row["label"]: row["human"] for row in heatmap.get("rows", [])}
     total_pc_contributions = heatmap.get("total_pc_contributions", {})
+
+    # Merge questionnaire + full biomarker values from /biomarker-data/latest
+    biomarker_latest = fetch_biomarker_data_latest(patient_uuid, token=token)
+    if biomarker_latest:
+        _skip = ("id", "patient_id", "source", "created_at", "updated_at", "measurement_date")
+        merged = {k: v for k, v in biomarker_latest.items()
+                  if k not in _skip and v is not None}
+        existing = data.get("biomarkers", {}) or {}
+        data["biomarkers"] = {**merged, **existing}  # existing values win on conflict
+        logger.info(f"Merged {len(merged)} biomarker-data/latest values for {patient_uuid}")
 
     significant_pcs = {k: v for k, v in total_pc_contributions.items() if v != 0}
     sorted_pcs = sorted(significant_pcs.items(), key=lambda x: abs(x[1]), reverse=True)
@@ -207,22 +226,31 @@ def build_context(
         if not patient_payload:
             patient_payload = search_patient(patient_id, query_vector)
             logger.info(f"Qdrant fallback for {patient_id}: {'hit' if patient_payload else 'miss'}")
-       
+
         if patient_payload:
-            from app.services.codebook import get_label
-            
             biomarkers = patient_payload.get("biomarkers", {})
             risks = patient_payload.get("risks", [])
 
-            
-
             logger.info(f"Patient {patient_id} biomarkers: {biomarkers}")
             logger.info(f"Patient {patient_id} risks: {risks}")
-            biomarker_str = "\n".join([
-                f"{get_label(k)} ({k}): {v}"
-                for k, v in biomarkers.items()
-                if v is not None and k not in ["id", "patient_id", "source", "created_at", "updated_at"]
-            ])
+            biomarker_lines = []
+            for k, v in biomarkers.items():
+                if k in ("id", "patient_id", "source", "created_at", "updated_at"):
+                    continue
+                if k in DEMOGRAPHIC_CODES:
+                    continue
+                raw = v.get("value") if isinstance(v, dict) else v
+                label = get_label(k)
+                if is_questionnaire(k):
+                    if raw is None:
+                        biomarker_lines.append(f"{label}: Not answered")
+                    else:
+                        biomarker_lines.append(f"{label}: {decode_questionnaire_value(k, raw)}")
+                else:
+                    if raw is None:
+                        continue
+                    biomarker_lines.append(f"{label} ({k}): {raw}")
+            biomarker_str = "\n".join(biomarker_lines)
 
             risk_str = "\n".join([
                 f"{r['disease_name']} — evidence score: {r['evidence_score']} — contributing PCs: {', '.join(r['contributing_pcs'])}"
@@ -259,12 +287,11 @@ def build_context(
 
             events = patient_payload.get("events", [])
             if events:
-                from app.services.longitudinal import _format_date
                 event_lines = [
                     f"- {_format_date(e.get('date', 'unknown'))}: {e.get('label', '')}"
                     for e in sorted(events, key=lambda x: x.get("date", ""))
                 ]
-                context_parts.append(f"\n=== Patient Life Events ===\n" + "\n".join(event_lines))
+                context_parts.append("\n=== Patient Life Events ===\n" + "\n".join(event_lines))
 
             context_parts.append(f"\n=== Biomarkers ===\n{biomarker_str}")
             context_parts.append(f"\n=== Disease Risks ===\n{risk_str}")
@@ -323,6 +350,12 @@ def build_context(
                     aging_status = "aging faster" if float(delta) > 0 else "aging slower"
                 except Exception:
                     aging_status = "unknown"
+                top_pcs = sorted(
+                    [(k, v) for k, v in payload.get("total_pc_contributions", {}).items() if v != 0],
+                    key=lambda x: abs(x[1]),
+                    reverse=True,
+                )[:3]
+                pc_str = ", ".join(f"{pc}:{val:+.2f}" for pc, val in top_pcs) if top_pcs else "N/A"
                 context_parts.append(
                     f"Name: {_patient_display_name(payload)} | "
                     f"Patient ID: {pid} | "
@@ -331,7 +364,8 @@ def build_context(
                     f"Chron Age: {payload.get('latest_chron_age')} | "
                     f"Bio Age: {payload.get('latest_bio_age')} | "
                     f"Delta: {delta} | "
-                    f"Status: {aging_status}"
+                    f"Status: {aging_status} | "
+                    f"Top PCs: {pc_str}"
                 )
             sources.append("all_patients")
         else:
@@ -438,12 +472,26 @@ def ingest_pdf(file_bytes: bytes):
     return len(chunks)
 
 
-def rag_query_stream(question: str, patient_id: Optional[str] = None, pc_group: Optional[str] = None, token: Optional[str] = None) -> tuple:
-    logger.info(f"RAG stream query | question: {question[:50]}...")
-    context, sources, _ = build_context(question, patient_id, pc_group, token=token)
-    prompt = build_prompt(question, context)
-    stream = stream_llm(prompt, system_prompt=SYSTEM_PROMPT)
-    return stream, sources
+def _resolve_seqn_from_message(question: str, token: Optional[str]) -> Optional[str]:
+    """
+    If the message mentions a SEQN-like number (5-digit starting with 9, e.g. 90002),
+    fetch the patient list and return the matching patient UUID. Returns None if not found.
+    """
+    match = re.search(r'\b(9\d{4})\b', question)
+    if not match:
+        return None
+    seqn_str = match.group(1)
+    try:
+        patients = fetch_all_patients(token)
+        for p in patients:
+            if str(p.get("seqn", "")) == seqn_str:
+                logger.info(f"Resolved SEQN {seqn_str} → patient_id {p.get('id')}")
+                return p.get("id")
+    except Exception as e:
+        logger.warning(f"SEQN resolution failed: {e}")
+    logger.warning(f"SEQN {seqn_str} mentioned in message but no matching patient found")
+    return None
+
 
 def rag_query(
     question: str,
@@ -451,9 +499,22 @@ def rag_query(
     pc_group: Optional[str] = None,
     token: Optional[str] = None,
 ) -> tuple[str, list[str]]:
-    from app.services.memory import get_history, save_turn
     history = get_history(token) if token else []
     prior_question = next((m["content"] for m in reversed(history) if m["role"] == "user"), None)
+
+    # Resolve SEQN from message text if no patient is selected in the sidebar
+    if not patient_id:
+        resolved = _resolve_seqn_from_message(question, token)
+        if resolved:
+            patient_id = resolved
+            if re.match(
+                r'^(please\s+)?(look at|show|pull up|open|view|display|check|get)\s+\d+',
+                question.strip(), re.IGNORECASE
+            ):
+                question = (
+                    "Give me a brief clinical summary of this patient: their age, gender, "
+                    "biological age, delta, top PC contributions, and the top 3 disease risks."
+                )
 
     # STEP 1: embed first (blocking)
     query_vector = embed_text(question)
@@ -461,7 +522,6 @@ def rag_query(
     # STEP 2: then ask LLM for variable extraction (after embed is done)
     biomarkers, pcs = [], []
     if patient_id:
-        from app.services.codebook import is_longitudinal_question
         available = get_force_included_variables()
         biomarkers, pcs = _extract_variables_with_llm(
             question,
@@ -473,6 +533,10 @@ def rag_query(
         if not biomarkers and not pcs and is_longitudinal_question(question):
             logger.warning("LLM extraction returned empty but question looks longitudinal — using default vitals")
             biomarkers = ["BPXSAR", "BPXDAR", "BPXPLS"]
+
+        # hard cap to prevent oversized LLM prompts
+        biomarkers = biomarkers[:5]
+        pcs = pcs[:5]
 
     needs_longitudinal = bool(biomarkers or pcs)
     logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
@@ -496,7 +560,6 @@ def rag_query(
     if longitudinal_future:
         longitudinal_data = longitudinal_future.result()
         if longitudinal_data:
-            from app.services.longitudinal import LONGITUDINAL_SYSTEM_PROMPT
             long_context = _format_longitudinal_context(
                 question=question,
                 data=longitudinal_data,

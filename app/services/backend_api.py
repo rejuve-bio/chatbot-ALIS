@@ -57,6 +57,35 @@ def fetch_all_patients(token) -> list[dict]:
         return []
 
 
+def fetch_biomarker_data_latest(patient_id: str, token: str) -> dict | None:
+    url = f"{ALIS_API_URL}/patients/{patient_id}/biomarker-data/latest"
+    headers = {"Content-Type": "application/json"}
+    if token:
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+    logger.info(f"Fetching latest biomarker data for patient {patient_id}")
+    try:
+        response = httpx.get(url, headers=headers, timeout=30.0)
+        if response.status_code == 404:
+            logger.warning(f"No biomarker data found for patient {patient_id}")
+            return None
+        response.raise_for_status()
+        data = response.json()
+        # If the API returns a list, take the most recent entry (last item)
+        if isinstance(data, list):
+            if not data:
+                return None
+            data = data[-1]
+        _q_prefixes = ("BPQ", "DIQ", "MCQ", "KIQ", "HUQ", "OSQ", "PFQ")
+        q_codes = {k: v for k, v in data.items() if k.startswith(_q_prefixes)}
+        logger.info(f"biomarker-data/latest questionnaire fields for {patient_id}: {q_codes}")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to fetch biomarker data for {patient_id}: {e}")
+        return None
+
+
 def fetch_longitudinal(
     patient_id: str,
     token: str,
