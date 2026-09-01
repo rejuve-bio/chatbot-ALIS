@@ -1,5 +1,3 @@
-# app/services/parsers/excel_parser.py
-
 import pandas as pd
 import io
 from typing import Optional
