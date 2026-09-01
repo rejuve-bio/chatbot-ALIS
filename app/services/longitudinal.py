@@ -67,12 +67,8 @@ def _extract_variables_with_llm(
     available_variables: dict[str, str],
     llm_generate,
     prior_question: str = None,
-) -> tuple[list[str], list[str]]:
-    """
-    Ask the LLM to identify which biomarker codes and PC names
-    are needed to answer the question.
-    Returns (biomarker_codes, pc_names)
-    """
+) -> tuple[list[str], list[str], bool, bool]:
+    """Returns (biomarker_codes, pc_names, needs_full_biomarkers, needs_disease_risks)."""
     var_list = "\n".join([
         f"{code}: {label}"
         for code, label in available_variables.items()
@@ -82,7 +78,9 @@ def _extract_variables_with_llm(
     if prior_question:
         context_line = f"\nPrevious question (for context): {prior_question}\n"
 
-    prompt = f"""You are helping select variables to answer a clinical question about a patient's health over time.
+    prompt = f"""You are deciding whether this clinical question needs its own
+extra data fetched from the patient's longitudinal record, on top of what's
+already available.
 
 Available biomarker variables:
 {var_list}
@@ -91,24 +89,56 @@ Available PC values: PC1 through PC59
 {context_line}
 Clinical question: {question}
 
-Which variables are needed to answer this question?
+The patient's current biomarker values, PC contributions, and disease risks
+are ALREADY included elsewhere in this conversation's context. You are not
+answering the question — only deciding whether fetching a SPECIFIC named
+variable's own record from the longitudinal API is genuinely needed beyond
+that.
+
+The principle: only select a variable if the question calls out that exact
+variable by name — a named biomarker (blood pressure, glucose, pulse...) or
+a specific PC (PC1, PC32...) — whether it's asking for that variable's
+current value or how it changed over time. If the question is broad or
+general instead — "what are the biomarkers," "show all PCs," an overview,
+a diagnosis/history question ("does this patient have asthma"), a ranking
+("top 3 PCs") — return EMPTY lists for both. None of those name a specific
+variable, and the broader information they need is already in the main
+patient context; this step exists only for named, specific lookups.
+Aging/delta/biological-age questions also return empty — those come from
+clock_results automatically, not from this lookup.
+
+When genuinely unsure, return empty lists — the main context already
+covers general and single-value lookups; this is only for the narrower
+case of a clearly named variable.
+
+Separately: the patient's context ALSO has a full "Biomarkers" section
+(every lab/vital/questionnaire value, ~70 lines) and a full "Disease
+Risks" section (every disease risk with evidence score and mechanisms).
+Both get included by default, but reading through them costs real time
+for questions that don't need them. Decide honestly whether THIS question
+needs each one:
+- needs_full_biomarkers: true if the question is actually about the
+  patient's lab values, vitals, medical history/questionnaire answers,
+  or asks to see biomarkers broadly (even without naming one specifically,
+  e.g. "what are this patient's biomarkers"). false for questions purely
+  about PCs, disease risk rankings, or biological age/delta.
+- needs_disease_risks: true if the question is about the patient's
+  disease risks, what conditions they're at risk for, or asks for a
+  diagnosis/history check not answered by the questionnaire alone. false
+  for pure biomarker or PC questions with no disease-risk angle.
+When unsure, default both to true — the safe side is including
+information, not silently omitting something the answer needed.
+
 Reply with ONLY a JSON object in this exact format, nothing else:
 {{
   "biomarkers": ["CODE1", "CODE2"],
   "pcs": ["PC1", "PC5"],
-  "terms_identified": ["pulse rate", "blood pressure"]
+  "terms_identified": ["pulse rate", "blood pressure"],
+  "needs_full_biomarkers": true,
+  "needs_disease_risks": true
 }}
 
-Rules:
-- Only include variables directly relevant to the question
-- DIAGNOSIS/HISTORY QUESTIONS: If the question asks whether the patient was diagnosed with, told they have, or has a history of a condition (e.g. "does this patient have asthma", "has the patient been told they have hypertension", "does the patient have diabetes") — return EMPTY lists for both biomarkers and pcs. These are questionnaire lookups, not time-series questions.
-- PC RANKING QUESTIONS: If the question asks which PCs are highest, lowest, top, most significant, or asks to rank/list a patient's PCs without specifying which ones (e.g. "get me the highest three PCs", "what are the top PCs", "which PC contributes the most") — return EMPTY lists. PC contribution rankings already exist in the patient profile.
-- For questions about trends, changes over time, longitudinal patterns, or "how has X changed": include the relevant biomarker codes
-- For questions about blood work, lab results, or a specific current value: include only biomarker codes, leave pcs as empty list
-- For questions about aging, delta, biological age, or clock results: leave both biomarkers and pcs as empty lists — those come from clock_results automatically
-- For questions explicitly about how a SPECIFIC named PC has changed over time (e.g. "how has PC1 changed", "show PC32 trend"): include ONLY that named PC in pcs, leave biomarkers empty
-- If genuinely unsure whether a question needs time-series data, return empty lists — the regular patient context handles single-value lookups
-- Maximum 5 biomarker codes, maximum 5 PC codes — never list all PCs
+Maximum 5 biomarker codes, maximum 5 PC codes — never list all PCs.
 """
 
     try:
@@ -124,14 +154,17 @@ Rules:
         biomarkers = parsed.get("biomarkers", [])
         pcs = parsed.get("pcs", [])
         terms = parsed.get("terms_identified", [])
+        needs_full_biomarkers = parsed.get("needs_full_biomarkers", True)
+        needs_disease_risks = parsed.get("needs_disease_risks", True)
         logger.info(
             f"LLM variable extraction | terms={terms} | "
-            f"biomarkers={biomarkers} | pcs={pcs}"
+            f"biomarkers={biomarkers} | pcs={pcs} | "
+            f"needs_full_biomarkers={needs_full_biomarkers} | needs_disease_risks={needs_disease_risks}"
         )
-        return biomarkers, pcs
+        return biomarkers, pcs, needs_full_biomarkers, needs_disease_risks
     except Exception as e:
         logger.warning(f"LLM variable extraction failed: {e} — falling back to codebook")
-        return [], []
+        return [], [], True, True
 
 
 
@@ -142,12 +175,8 @@ def _format_longitudinal_context(
     pcs_requested: list[str],
     patient_payload: dict | None,
 ) -> str:
-    """
-    Build the full context string for the LLM to reason about.
-    """
     parts = []
 
-    # patient profile from Qdrant
     if patient_payload:
         chron = patient_payload.get("latest_chron_age", "N/A")
         bio = patient_payload.get("latest_bio_age", "N/A")
@@ -203,8 +232,6 @@ def _format_longitudinal_context(
             for e in sorted(events, key=lambda x: x.get("date", "")):
                 parts.append(f"- {_format_date(e.get('date', 'unknown'))}: {e.get('label', '')}")
 
-    # questionnaire snapshot — always include so LLM can answer diagnosis questions
-    # even when this function is reached via longitudinal path
     if patient_payload:
         biomarkers_snap = patient_payload.get("biomarkers", {})
         q_lines = []
@@ -219,7 +246,6 @@ def _format_longitudinal_context(
         if q_lines:
             parts.append("\n=== Patient Questionnaire (Medical History) ===\n" + "\n".join(q_lines))
 
-    # biomarker time series — pre-built as markdown tables
     biomarker_data = data.get("biomarkers", {})
     if biomarker_data:
         parts.append("=== Biomarker Time Series ===")
@@ -243,7 +269,6 @@ def _format_longitudinal_context(
                         prev_val = value
                 parts.append("\n".join(rows))
 
-    # clock results — only include if the question is about biological age or aging
     age_keywords = ["bio age", "biological age", "delta", "aging", "clock", "older", "younger"]
     include_clock = any(kw in question.lower() for kw in age_keywords)
     clock_results = data.get("clock_results", []) if include_clock else []
@@ -259,7 +284,6 @@ def _format_longitudinal_context(
             rows.append(f"| {date} | {bio_age} | {chron_age} | {delta_str} |")
         parts.append("\n".join(rows))
 
-    # PC values over time
     pc_data = data.get("pcs", {})
     if pc_data:
         parts.append("\n=== PC Values Over Time ===")
@@ -270,7 +294,6 @@ def _format_longitudinal_context(
                 value = r.get("value", "N/A")
                 parts.append(f"  {date}: {value:+.4f}" if isinstance(value, float) else f"  {date}: {value}")
 
-    # what was requested — for the LLM to explain its variable choices
     parts.append("\n=== Variables Requested ===")
     for code in biomarkers_requested:
         parts.append(f"  {code}: {get_label(code)}")
@@ -289,25 +312,20 @@ def answer_longitudinal_question(
     patient_payload: dict | None = None,
     llm_generate=None,
 ) -> tuple[str, list[str]]:
-    """
-    Main entry point for longitudinal questions.
-    Returns (answer_text, sources)
-    """
+    """Returns (answer_text, sources)."""
     logger.info(
         f"Longitudinal query | patient={patient_id} | question={question[:60]}"
     )
 
-    # step 1: detect which variables are needed
     biomarkers = []
     pcs = []
 
     if llm_generate:
         available = get_force_included_variables()
-        biomarkers, pcs = _extract_variables_with_llm(
+        biomarkers, pcs, _, _ = _extract_variables_with_llm(
             question, available, llm_generate
         )
 
-    # if nothing detected, fetch a minimal default set
     if not biomarkers and not pcs:
         logger.warning(
             "No variables detected — fetching default vital signs"
@@ -318,7 +336,6 @@ def answer_longitudinal_question(
         f"Final variable selection | biomarkers={biomarkers} | pcs={pcs}"
     )
 
-    # step 2: fetch longitudinal data from ALIS API
     data = fetch_longitudinal(
         patient_id=patient_id,
         token=token,
@@ -333,7 +350,6 @@ def answer_longitudinal_question(
             []
         )
 
-    # step 3: build context
     context = _format_longitudinal_context(
         question=question,
         data=data,
@@ -342,7 +358,6 @@ def answer_longitudinal_question(
         patient_payload=patient_payload,
     )
 
-    # step 4: call LLM with structured context
     prompt = f"""
 Clinical longitudinal data for patient analysis:
 

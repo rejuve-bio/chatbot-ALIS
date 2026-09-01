@@ -1,27 +1,30 @@
 
 import re
+import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from dotenv import load_dotenv
 
 from app.services.llm_service import embed_text, embed_batch, call_llm
 from app.services.qdrant_service import (
-    search_patient, search_pc_knowledge,
-    upsert_patient, list_patients, get_patient_count,
-    upsert_pc_chunks,
+    search_pc_knowledge,
+    list_patients,
+    upsert_pc_chunks, search_chunks,
 )
 from app.services.backend_api import fetch_patient, fetch_longitudinal, fetch_all_patients, fetch_biomarker_data_latest
-from app.services.parsers.excel_parser import parse_excel
-from app.services.parsers.pdf_parser import parse_pdf
+from app.services.ingestion.excel_parser import parse_excel
+from app.services.ingestion.pdf_parser import parse_pdf
 from app.services.longitudinal import (
     _extract_variables_with_llm, _format_longitudinal_context,
     _format_date, LONGITUDINAL_SYSTEM_PROMPT,
 )
 from app.services.codebook import (
     get_force_included_variables, get_label, decode_questionnaire_value,
-    is_questionnaire, DEMOGRAPHIC_CODES, is_longitudinal_question,
+    is_questionnaire, DEMOGRAPHIC_CODES,
 )
 from app.services.memory import get_history, save_turn
+from app.services.glossary import match_glossary_question, needs_population_data, needs_biology_evidence
 
 load_dotenv()
 
@@ -40,6 +43,8 @@ PATIENT SELECTION RULES — read this before answering anything:
 - If the context is "All Patients Summary": answer population questions (who is aging fastest, compare patients, list all patients, most common/significant PCs across all subjects, which PC appears most often, rank PCs by contribution across patients). For anything else that requires a single patient's full record, respond: "Please select a specific patient or provide a patient name, ID, or SEQN to view their [biomarkers / heart rate / PC scores / etc.]."
 - If a patient IS selected but their data does not contain what was asked: respond "I wasn't able to find that information in this patient's data."
 - Never say "I wasn't able to find that information" when no patient is selected — that response is only for when a patient IS selected.
+- If NO patient is selected and the context is not an "All Patients Summary" either — e.g. someone just asked what a specific PC group means — this is a plain informational lookup, not a patient consultation. Answer naturally in your own words, at least 3-4 sentences, explaining what it is and why it matters. Do not use a table, do not use bullet points, and do not add a "most actionable implication" sentence — there is no patient here for anything to be actionable for.
+- USING CONVERSATION HISTORY TO RESOLVE FOLLOW-UPS: if an earlier message in this conversation asked a specific question (e.g. "what are the biomarkers") but got the "please select a specific patient" response because no patient was identified yet, and a patient IS identified now (by name, ID, or SEQN) with the current message otherwise adding no new question of its own — treat the current message as answering that pending question for this now-identified patient. Answer the earlier question directly; do not ask the clinician to repeat or clarify what they already asked.
 
 SCOPE:
 - Greetings (hi, hello, good morning): respond briefly and warmly, e.g. "Hello! How can I help with your patient today?"
@@ -53,6 +58,7 @@ FORMATTING — use the simplest format that fits:
 - PC comparison (e.g. PC1M vs PC1F): markdown table (| Dimension | PC_A | PC_B |).
 - Life events: only use a table if the clinician explicitly asks to list events; otherwise mention them inline.
 - Separate sections: use ## headers. Lists of observations: use bullet points.
+- Broad biomarker requests with nothing specific named (e.g. "what are this patient's biomarkers", "show me their labs"): do NOT retype every line from the context verbatim — that's a wall of text, not an answer. Lead with anything abnormal or flagged ("Yes" questionnaire answers, out-of-range values), then a handful of key vitals (blood pressure, BMI, glucose). Never omit an abnormal or clinically notable value from this summary. End by noting more measured values exist and offering to list a specific one or the full set if the clinician wants it.
 
 CLINICAL RULES:
 - PC contribution values must always include direction: positive = aging faster, negative = protective.
@@ -63,6 +69,13 @@ CLINICAL RULES:
 - Questionnaire answers appear in the Biomarkers section with Yes/No values. Use these to answer questions about medical history (hypertension, diabetes, smoking, fractures, etc.).
 - When asked about a condition (e.g. "does this patient have hypertension"), look for the relevant questionnaire variable in the Biomarkers section and answer from it directly.
 - If the Biomarkers section has no questionnaire answer for the condition asked, check the Disease Risks section — if the condition appears there with an evidence score, report it (e.g. "The questionnaire data does not confirm this, but Hypertension is listed as a top disease risk with an evidence score of 9.9").
+
+INVESTIGATIONAL EVIDENCE RULES:
+- The "Investigational, Preclinical Evidence" section (if present) is preclinical/experimental data from sources like DrugAge, GenAge, CellAge, and ClinPGx — it is NOT clinical guidance and never overrides it.
+- Never present this evidence as a treatment recommendation, and never imply it is validated in humans unless its evidence_tier is explicitly "human".
+- If evidence_tier is "animal_model", always name the species tested and state plainly that it has not been validated in humans.
+- Keep this evidence clearly separate from the Clinical guidance / Disease Risks sections — never blend the two into one claim.
+- Only bring this section into the answer if the clinician's question is actually about interventions, compounds, genes, or mechanisms — not for routine biomarker/PC questions.
 
 SYNTHESIS:
 - End every clinical answer with one sentence on the single most actionable implication, citing an actual number from the context.
@@ -123,7 +136,18 @@ def build_patient_text_summary(data: dict) -> str:
     )
 
 
+_PATIENT_FETCH_CACHE: dict[str, tuple[float, dict]] = {}
+_PATIENT_FETCH_TTL_SECONDS = 180  # 3 minutes
+
 def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
+    """Fetches only — no embed/upsert. 3-minute in-memory TTL cache."""
+    now = time.time()
+    cached = _PATIENT_FETCH_CACHE.get(patient_uuid)
+    if cached and (now - cached[0]) < _PATIENT_FETCH_TTL_SECONDS:
+        logger.info(f"Patient {patient_uuid} served from short-TTL cache "
+                    f"({now - cached[0]:.0f}s old) — skipping ALIS re-fetch")
+        return cached[1]
+
     logger.info(f"Fetching patient {patient_uuid} from ALIS API")
     data = fetch_patient(patient_uuid, token=token)
     if not data:
@@ -134,7 +158,6 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
     label_to_human = {row["label"]: row["human"] for row in heatmap.get("rows", [])}
     total_pc_contributions = heatmap.get("total_pc_contributions", {})
 
-    # Merge questionnaire + full biomarker values from /biomarker-data/latest
     biomarker_latest = fetch_biomarker_data_latest(patient_uuid, token=token)
     if biomarker_latest:
         _skip = ("id", "patient_id", "source", "created_at", "updated_at", "measurement_date")
@@ -146,9 +169,6 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
 
     significant_pcs = {k: v for k, v in total_pc_contributions.items() if v != 0}
     sorted_pcs = sorted(significant_pcs.items(), key=lambda x: abs(x[1]), reverse=True)
-
-    text_summary = build_patient_text_summary(data)  # ← was missing
-    vector = embed_text(text_summary)                 # ← was missing
 
     payload = {
         "seqn": data.get("seqn"),
@@ -165,17 +185,15 @@ def fetch_and_store_patient(patient_uuid: str, token: str) -> dict | None:
         "significant_pcs_ranked": sorted_pcs,
         "events": data.get("events", []),
         "clinician_name": (data.get("clinician") or {}).get("name"),
-        "text_summary": text_summary
     }
 
-    upsert_patient(patient_uuid, text_summary, vector, payload)
-    logger.info(f"Patient {patient_uuid} stored in Qdrant successfully")
+    _PATIENT_FETCH_CACHE[patient_uuid] = (time.time(), payload)
     return payload
 
 
 def populate_all_patients(token: str) -> dict[str, dict]:
-    """Bulk-populate Qdrant with all patients from /patients. Returns pid -> payload map."""
-    logger.info("Patient collection is empty — bulk-fetching all patients from /patients")
+    """Unused — kept for a future scheduler that syncs Qdrant on its own cadence."""
+    logger.info("Bulk-fetching all patients from /patients")
     all_items = fetch_all_patients(token=token)
     results: dict[str, dict] = {}
     for item in all_items:
@@ -188,7 +206,7 @@ def populate_all_patients(token: str) -> dict[str, dict]:
                 results[pid] = payload
         except Exception as e:
             logger.warning(f"populate_all_patients: failed for {pid}: {e}")
-    logger.info(f"Bulk population complete — {len(results)} patients stored in Qdrant")
+    logger.info(f"Bulk fetch complete — {len(results)} patients fetched")
     return results
 
 
@@ -198,7 +216,10 @@ def build_context(
     pc_group: Optional[str] = None,
     token: Optional[str] = None,
     query_vector: Optional[list] = None,
-) -> tuple[str, list[str], Optional[dict]]:
+    check_biology_evidence: bool = True,
+    include_biomarkers: bool = True,
+    include_disease_risks: bool = True,
+) -> tuple[str, list[str], Optional[dict], Optional[list[str]]]:
     logger.info(f"Building context | patient_id: {patient_id} | pc_group: {pc_group}")
     if query_vector is None:
         query_vector = embed_text(question)
@@ -208,24 +229,11 @@ def build_context(
 
     if patient_id:
         if token:
-            if get_patient_count() == 0:
-                # First ever patient query — bulk-populate all patients to seed Qdrant,
-                # then use this patient's result directly (avoids a second API call)
-                logger.info("Patient collection is empty — bulk-populating all patients from /patients")
-                all_payloads = populate_all_patients(token)
-                patient_payload = all_payloads.get(patient_id)
-            else:
-                # Collection already seeded — always fetch fresh for this specific patient
-                try:
-                    patient_payload = fetch_and_store_patient(patient_id, token=token)
-                    logger.info(f"Patient {patient_id} fetched fresh from ALIS API")
-                except Exception as e:
-                    logger.warning(f"ALIS API unavailable for {patient_id}: {e} — falling back to Qdrant")
-
-        # Fallback: Qdrant cache (no token, or API was down)
-        if not patient_payload:
-            patient_payload = search_patient(patient_id, query_vector)
-            logger.info(f"Qdrant fallback for {patient_id}: {'hit' if patient_payload else 'miss'}")
+            try:
+                patient_payload = fetch_and_store_patient(patient_id, token=token)
+                logger.info(f"Patient {patient_id} fetched fresh from ALIS API")
+            except Exception as e:
+                logger.warning(f"ALIS API unavailable for {patient_id}: {e} — no patient data for this message")
 
         if patient_payload:
             biomarkers = patient_payload.get("biomarkers", {})
@@ -264,7 +272,6 @@ def build_context(
                 reverse=True
             )
 
-            # pre-built markdown table for "most significant PCs" questions
             pc_table_rows = ["| PC | Contribution | Direction |", "|---|---|---|"]
             for pc, val in significant_pcs[:8]:
                 direction = "Aging faster" if val > 0 else "Protective"
@@ -293,8 +300,14 @@ def build_context(
                 ]
                 context_parts.append("\n=== Patient Life Events ===\n" + "\n".join(event_lines))
 
-            context_parts.append(f"\n=== Biomarkers ===\n{biomarker_str}")
-            context_parts.append(f"\n=== Disease Risks ===\n{risk_str}")
+            if include_biomarkers:
+                context_parts.append(f"\n=== Biomarkers ===\n{biomarker_str}")
+            else:
+                logger.info(f"Skipping full Biomarkers section for {patient_id} — not relevant to this question")
+            if include_disease_risks:
+                context_parts.append(f"\n=== Disease Risks ===\n{risk_str}")
+            else:
+                logger.info(f"Skipping full Disease Risks section for {patient_id} — not relevant to this question")
             logger.info(f"Patient {patient_id} context parts: {context_parts}")
             sources.append(f"patient:{patient_id}")
             logger.info(f"Patient context built successfully for {patient_id}")
@@ -302,10 +315,7 @@ def build_context(
             logger.warning(f"No data found for patient {patient_id}")
             context_parts.append(f"No data found for patient {patient_id}.")
 
-    else:
-        # No patient selected — population-level summary
-        # Primary: fetch clinic patients from API (always fresh + clinic-filtered by token)
-        # Fallback: Qdrant cache if API is unavailable
+    elif needs_population_data(question):
         api_available = False
         clinic_ids: set[str] = set()
         qdrant_map: dict[str, dict] = {}
@@ -319,12 +329,10 @@ def build_context(
             except Exception as e:
                 logger.warning(f"ALIS API unavailable for population query: {e} — falling back to Qdrant")
 
-        # Build Qdrant map (used either as fallback or to fill gaps)
         qdrant_patients = list_patients()
         qdrant_map = {p["id"]: p.get("payload", {}) for p in qdrant_patients}
 
         if api_available and clinic_ids:
-            # Refresh all clinic patients from API so population data is always current
             for pid in clinic_ids:
                 try:
                     payload = fetch_and_store_patient(pid, token=token)
@@ -334,7 +342,6 @@ def build_context(
                     logger.warning(f"Population: could not refresh patient {pid}: {e}")
             display_ids = clinic_ids
         else:
-            # API down — use everything in Qdrant
             display_ids = qdrant_map.keys()
 
         logger.info(f"No patient_id — building population context from {len(display_ids)} patients")
@@ -374,12 +381,11 @@ def build_context(
     pc_hits = search_pc_knowledge(query_vector, pc_group=pc_group, limit=3)
     logger.info(f"PC knowledge hits: {len(pc_hits)}")
     if pc_hits:
-        patient_gender = (patient_payload or {}).get("gender", "").lower()  # "female" or "male"
+        patient_gender = (patient_payload or {}).get("gender", "").lower()
         total_pc_contributions = (patient_payload or {}).get("total_pc_contributions", {})
         context_parts.append("\n=== PC Clinical Interpretation ===")
         for hit in pc_hits:
             hit_pc_group = hit.get("pc_group", "")
-            # detect gender suffix on the PC group name (e.g. PC1M, PC2F)
             hit_suffix = hit_pc_group[-1].lower() if hit_pc_group and hit_pc_group[-1].lower() in ("m", "f") else None
             gender_mismatch = (
                 hit_suffix == "m" and patient_gender == "female"
@@ -388,8 +394,7 @@ def build_context(
             if gender_mismatch:
                 correct_suffix = "F" if hit_suffix == "m" else "M"
                 correct_pc_group = hit_pc_group[:-1] + correct_suffix
-                # the patient's contribution key is the number part only e.g. "PC1"
-                pc_number = hit_pc_group[:-1]  # e.g. "PC1" from "PC1M"
+                pc_number = hit_pc_group[:-1]
                 patient_pc_value = total_pc_contributions.get(pc_number)
 
                 context_parts.append(
@@ -401,7 +406,6 @@ def build_context(
                         f"This patient's {pc_number} contribution is {patient_pc_value:+.3f}."
                     )
 
-                # fetch the correct gender's PC knowledge and include it
                 correct_hits = search_pc_knowledge(query_vector, pc_group=correct_pc_group, limit=2)
                 if correct_hits:
                     for correct_hit in correct_hits:
@@ -428,9 +432,37 @@ def build_context(
                 )
                 sources.append(f"pc_knowledge:{hit_pc_group}")
 
+    resource = None
+    biology_hits = []
+    if check_biology_evidence:
+        from app.services.biology_service import ATLAS_RESOURCES_FOR_CHAT
+
+        with ThreadPoolExecutor(max_workers=len(ATLAS_RESOURCES_FOR_CHAT)) as executor:
+            futures = [
+                executor.submit(search_chunks, collection, query_vector, limit=2, min_score=0.6)
+                for collection in ATLAS_RESOURCES_FOR_CHAT
+            ]
+            biology_hits = [hit for f in futures for hit in f.result()]
+        logger.info(f"Investigational biology search | collections={ATLAS_RESOURCES_FOR_CHAT} | "
+                    f"total_hits={len(biology_hits)}")
+    else:
+        logger.info("Skipping investigational biology search — question not relevant to compounds/genes/evidence")
+
+    if biology_hits:
+        context_parts.append("\n=== Investigational, Preclinical Evidence (not validated in humans unless noted) ===")
+        for hit in biology_hits:
+            name = hit.get("name") or hit.get("compound_name") or "unknown"
+            context_parts.append(
+                f"{name} | source: {hit.get('source')} | evidence_tier: {hit.get('evidence_tier')} | "
+                f"{hit.get('raw_text', '')}"
+            )
+        sources.append("biology_evidence")
+        resource = sorted({hit.get("source") for hit in biology_hits if hit.get("source")})
+        logger.info(f"Resource key set from biology collections: {resource}")
+
     context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
-    logger.info("Context built after searching pc knowledge {context_str}")
-    return context_str, sources, patient_payload
+    logger.info(f"Context built after searching pc knowledge {context_str}")
+    return context_str, sources, patient_payload, resource
 
 
 def build_prompt(question: str, context: str) -> str:
@@ -473,10 +505,7 @@ def ingest_pdf(file_bytes: bytes):
 
 
 def _resolve_seqn_from_message(question: str, token: Optional[str]) -> Optional[str]:
-    """
-    If the message mentions a SEQN-like number (5-digit starting with 9, e.g. 90002),
-    fetch the patient list and return the matching patient UUID. Returns None if not found.
-    """
+    """Matches a 5-digit SEQN-like number (e.g. 90002) and resolves it to a patient UUID."""
     match = re.search(r'\b(9\d{4})\b', question)
     if not match:
         return None
@@ -498,11 +527,36 @@ def rag_query(
     patient_id: Optional[str] = None,
     pc_group: Optional[str] = None,
     token: Optional[str] = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], Optional[list[str]]]:
     history = get_history(token) if token else []
     prior_question = next((m["content"] for m in reversed(history) if m["role"] == "user"), None)
 
-    # Resolve SEQN from message text if no patient is selected in the sidebar
+    # glossary classify (LLM_HOST) and variable-extraction (LLM_HOST_2) run
+    # concurrently — separate GPUs, safe; two concurrent calls to the SAME
+    # host is not (commit 1a3157c).
+    extraction_result = None
+    with ThreadPoolExecutor(max_workers=2) as speculative_executor:
+        glossary_future = speculative_executor.submit(
+            match_glossary_question, question, has_patient=patient_id is not None
+        )
+        extraction_future = None
+        if patient_id:
+            available = get_force_included_variables()
+            extraction_future = speculative_executor.submit(
+                _extract_variables_with_llm,
+                question, available, lambda p: call_llm(p, use_secondary=True), prior_question,
+            )
+
+        general_answer = glossary_future.result()
+        if general_answer is not None:
+            logger.info(f"rag_query | answered generally, skipping full pipeline: {question!r}")
+            if token:
+                save_turn(token, question, general_answer)
+            return general_answer, ["glossary"], None
+
+        if extraction_future:
+            extraction_result = extraction_future.result()
+
     if not patient_id:
         resolved = _resolve_seqn_from_message(question, token)
         if resolved:
@@ -516,36 +570,36 @@ def rag_query(
                     "biological age, delta, top PC contributions, and the top 3 disease risks."
                 )
 
-    # STEP 1: embed first (blocking)
     query_vector = embed_text(question)
 
-    # STEP 2: then ask LLM for variable extraction (after embed is done)
     biomarkers, pcs = [], []
-    if patient_id:
+    needs_full_biomarkers, needs_disease_risks = True, True
+    if extraction_result is not None:
+        biomarkers, pcs, needs_full_biomarkers, needs_disease_risks = extraction_result
+    elif patient_id:
         available = get_force_included_variables()
-        biomarkers, pcs = _extract_variables_with_llm(
+        biomarkers, pcs, needs_full_biomarkers, needs_disease_risks = _extract_variables_with_llm(
             question,
             available,
             lambda p: call_llm(p),
             prior_question=prior_question,
         )
-        # fallback: if keyword check fires but LLM returned nothing, use default vitals
-        if not biomarkers and not pcs and is_longitudinal_question(question):
-            logger.warning("LLM extraction returned empty but question looks longitudinal — using default vitals")
-            biomarkers = ["BPXSAR", "BPXDAR", "BPXPLS"]
 
-        # hard cap to prevent oversized LLM prompts
+    if patient_id:
         biomarkers = biomarkers[:5]
         pcs = pcs[:5]
 
     needs_longitudinal = bool(biomarkers or pcs)
     logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
 
-    # STEP 3: NOW parallel is safe — both are API calls, not Ollama
-    from concurrent.futures import ThreadPoolExecutor
+    # build_context() must stay free of its own call_llm() calls — it runs
+    # concurrently with fetch_longitudinal() below (commit 1a3157c).
+    check_biology = needs_biology_evidence(question)
+
     with ThreadPoolExecutor(max_workers=2) as executor:
         context_future = executor.submit(
-            build_context, question, patient_id, pc_group, token, query_vector
+            build_context, question, patient_id, pc_group, token, query_vector,
+            check_biology, needs_full_biomarkers, needs_disease_risks
         )
         longitudinal_future = executor.submit(
             fetch_longitudinal,
@@ -555,7 +609,7 @@ def rag_query(
             pcs=pcs,
         ) if (patient_id and needs_longitudinal) else None
 
-    context, sources, patient_payload = context_future.result()
+    context, sources, patient_payload, resource = context_future.result()
 
     if longitudinal_future:
         longitudinal_data = longitudinal_future.result()
@@ -572,10 +626,10 @@ def rag_query(
             answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True, history=history)
             if token:
                 save_turn(token, question, answer)
-            return answer, sources
+            return answer, sources, None
 
     prompt = build_prompt(question, context)
     answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT, history=history)
     if token:
         save_turn(token, question, answer)
-    return answer, sources
+    return answer, sources, resource

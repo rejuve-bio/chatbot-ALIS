@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 
 from app.routers import router
 from app.services.qdrant_service import init_collections
+from app.services.biology_service import init_biology_collections
+from app.services.llm_service import preload_embedding_model
 from app.services.codebook import load_codebook
 load_codebook()
 
@@ -19,9 +21,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting up — preloading embedding model...")
+    preload_embedding_model()
+    logger.info("Embedding model ready")
     logger.info("Starting up — initializing Qdrant collections...")
     init_collections()
     logger.info("Qdrant collections ready")
+    logger.info("Initializing biology-evidence collections (creates + populates only what's missing)...")
+    init_biology_collections()
+    logger.info("Biology-evidence collections ready")
     yield
     logger.info("Shutting down...")
 

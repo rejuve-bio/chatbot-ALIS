@@ -28,8 +28,9 @@ def fetch_patient(patient_uuid: str, token: str) -> dict | None:
             logger.warning(f"Patient {patient_uuid} not found in ALIS API")
             return None
         response.raise_for_status()
-        logger.info(f"Successfully fetched patient {patient_uuid}")
-        return response.json()
+        data = response.json()
+        logger.info(f"Successfully fetched patient {patient_uuid} | API response: {data}")
+        return data
     except Exception as e:
         logger.error(f"Failed to fetch patient {patient_uuid}: {e}")
         return None
