@@ -9,6 +9,7 @@ from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue
 )
+from datas.pc_chunks import PC_CHUNKS
 
 load_dotenv()
 
@@ -40,7 +41,6 @@ def _with_retries(fn, description: str, retries: int = 3):
 
 def _populate_pc_collection():
     try:
-        from data.pc_chunks import PC_CHUNKS
         from app.services.llm_service import embed_batch
         texts = [chunk["raw_text"] for chunk in PC_CHUNKS]
         vectors = embed_batch(texts)

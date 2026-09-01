@@ -9,6 +9,7 @@ from app.services.biology_service import (
 )
 from app.services.clinicaltrials_service import get_active_trials_for_compound
 from app.services.llm_service import call_llm
+from datas.pc_chunks import PC_CHUNKS
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,6 @@ CRITICAL RULES:
 
 def get_mechanisms_for_pc_group(pc_group: str) -> tuple[list[str], list[str]]:
     """"Indeterminate" is dropped — it means no real mechanism was assignable."""
-    from data.pc_chunks import PC_CHUNKS
     mechanisms: list[str] = []
     diseases: list[str] = []
     for chunk in PC_CHUNKS:
