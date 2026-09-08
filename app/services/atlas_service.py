@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from app.services.biology_service import (
@@ -199,22 +200,36 @@ def _explain_pc_groups(pc_group: str | None) -> list[dict]:
     return explained
 
 
+_ATLAS_CACHE: dict[tuple[str | None, str | None], tuple[float, dict]] = {}
+_ATLAS_CACHE_TTL_SECONDS = 1800  # evidence only changes on a population re-run, not per-request
+
+
 def build_atlas_response(
     mechanism_tags: list[str],
     pc_group: str | None = None,
     disease_name: str | None = None,
 ) -> dict:
+    """Cached by (disease_name, pc_group) — same disease+PCs means same evidence regardless of patient."""
+    cache_key = (disease_name, pc_group)
+    cached = _ATLAS_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _ATLAS_CACHE_TTL_SECONDS:
+        logger.info(f"build_atlas_response | cache hit for {cache_key}")
+        return dict(cached[1])
+
     logger.info(f"build_atlas_response | pc_group={pc_group} | disease={disease_name} | "
                 f"mechanisms={mechanism_tags}")
 
     _background_executors: list[ThreadPoolExecutor] = []
     try:
-        return _build_atlas_response_inner(
+        result = _build_atlas_response_inner(
             mechanism_tags, pc_group, disease_name, _background_executors
         )
     finally:
         for ex in _background_executors:
             ex.shutdown(wait=False)
+
+    _ATLAS_CACHE[cache_key] = (time.time(), result)
+    return dict(result)
 
 
 def _build_atlas_response_inner(
