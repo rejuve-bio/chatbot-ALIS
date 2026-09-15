@@ -256,8 +256,13 @@ def get_target_genes_for_drug(compound_name: str) -> list[dict]:
             if d and d not in candidates and d.lower() != compound_name.lower():
                 candidates.append(d)
         if candidates:
-            with _drug_synonym_llm_lock:
-                confirmed = _llm_disambiguate_drug_synonym(compound_name, candidates)
+            try:
+                with _drug_synonym_llm_lock:
+                    confirmed = _llm_disambiguate_drug_synonym(compound_name, candidates)
+            except Exception as e:
+                logger.warning(f"get_target_genes_for_drug | compound={compound_name} | "
+                                f"synonym disambiguation failed, skipping: {e}")
+                confirmed = None
             if confirmed:
                 hits = filter_chunks(CLINPGX_COLLECTION, {"drug_name": confirmed}, limit=20)
                 logger.info(f"get_target_genes_for_drug | compound={compound_name} | "
@@ -368,6 +373,87 @@ def _search_disease_specific(collection: str, disease_name: str | None, limit: i
     return search_chunks(collection, query_vector, limit=limit)
 
 
+_GENE_SOURCE_COLLECTIONS = [
+    GENAGE_HUMAN_COLLECTION, GENAGE_MODELS_COLLECTION,
+    CELLAGE_COLLECTION, CELLAGE_SIGNATURES_COLLECTION,
+]
+
+
+def _search_genes(query_vector: list[float], limit: int = 15) -> list[str]:
+    
+    with ThreadPoolExecutor(max_workers=len(_GENE_SOURCE_COLLECTIONS)) as executor:
+        futures = [
+            executor.submit(search_chunks, collection, query_vector, limit=6)
+            for collection in _GENE_SOURCE_COLLECTIONS
+        ]
+        hits = [hit for f in futures for hit in f.result()]
+
+    genes = []
+    for hit in hits:
+        gene = hit.get("name")
+        if gene and gene not in genes:
+            genes.append(gene)
+    return genes[:limit]
+
+
+def _find_mechanism_relevant_genes(
+    mechanism_query_vector: list[float], disease_name: str | None, limit: int = 15
+) -> list[str]:
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        disease_future = (
+            executor.submit(_search_genes, embed_text(disease_name), limit)
+            if disease_name else None
+        )
+        mechanism_future = executor.submit(_search_genes, mechanism_query_vector, limit)
+        disease_genes = disease_future.result() if disease_future else []
+        mechanism_genes = mechanism_future.result()
+
+    genes = list(disease_genes)
+    for g in mechanism_genes:
+        if g not in genes:
+            genes.append(g)
+    genes = genes[:limit]
+    logger.info(f"_find_mechanism_relevant_genes | disease_genes={disease_genes} | "
+                f"mechanism_genes={mechanism_genes} | combined={genes}")
+    return genes
+
+
+def _find_drugage_chunk_by_name(compound: str) -> dict | None:
+    for variant in (compound, compound.lower(), compound.upper(), compound.capitalize()):
+        hits = filter_chunks(DRUGAGE_COLLECTION, {"name": variant}, limit=1)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _find_gene_target_compounds(genes: list[str], limit: int = 5) -> list[dict]:
+    seen_compounds: set[str] = set()
+    hits: list[dict] = []
+    for gene in genes:
+        if len(hits) >= limit:
+            break
+        drug_hits = filter_chunks(CLINPGX_COLLECTION, {"name": gene}, limit=10)
+        for d in drug_hits:
+            compound = d.get("drug_name")
+            if not compound or compound.lower() in seen_compounds:
+                continue
+            drugage_chunk = _find_drugage_chunk_by_name(compound)
+            hit = drugage_chunk or {
+                "name": compound,
+                "source": "ClinPGx",
+                "evidence_tier": d.get("evidence_tier", "human"),
+                "organism": None,
+                "evidence": [],
+            }
+            seen_compounds.add(compound.lower())
+            hits.append(hit)
+            if len(hits) >= limit:
+                break
+    logger.info(f"_find_gene_target_compounds | genes={genes} | found={[h.get('name') for h in hits]}")
+    return hits
+
+
 def search_investigational_compounds(
     mechanism_tags: list[str], disease_name: str | None = None, limit: int = 5
 ) -> list[dict]:
@@ -385,16 +471,16 @@ def search_investigational_compounds(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         mechanism_future = executor.submit(search_chunks, DRUGAGE_COLLECTION, query_vector, limit=limit)
-        disease_future = executor.submit(_search_disease_specific, DRUGAGE_COLLECTION, disease_name, limit)
+        genes_future = executor.submit(_find_mechanism_relevant_genes, query_vector, disease_name)
         mechanism_hits = mechanism_future.result()
-        disease_hits = disease_future.result()
+        gene_relevant_genes = genes_future.result()
+    gene_driven_hits = _find_gene_target_compounds(gene_relevant_genes, limit=limit)
     logger.info(f"search_investigational_compounds | mechanism_hits={[h.get('name') for h in mechanism_hits]} | "
-                f"disease_hits={[h.get('name') for h in disease_hits]}")
+                f"gene_driven_hits={[h.get('name') for h in gene_driven_hits]}")
 
-    
     seen_compounds = set()
     selected_hits = []
-    for hit in disease_hits + mechanism_hits:
+    for hit in gene_driven_hits + mechanism_hits:
         if len(selected_hits) >= limit:
             break
         compound = hit.get("name")
@@ -423,6 +509,7 @@ def search_investigational_compounds(
             "source": hit.get("source", "DrugAge"),
             "evidence_tier": hit.get("evidence_tier", "animal_model"),
             "species": hit.get("organism"),
+            "raw_evidence": hit.get("evidence", []),
 
             "note": None,
             "gene_level_grounding": gene_level_grounding,

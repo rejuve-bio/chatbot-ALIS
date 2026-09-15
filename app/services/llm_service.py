@@ -8,7 +8,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-LLM_HOST = os.getenv("LLM_HOST", "http://202.181.159.222:8002")
+LLM_HOST = os.getenv("LLM_HOST")
 LLM_MODEL = os.getenv("LLM_MODEL")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
@@ -70,9 +70,8 @@ def call_llm(
     history: list[dict] = None,
     use_secondary: bool = False,
 ) -> str:
-    """use_secondary=True routes to LLM_HOST_2 — for a call meant to run concurrently with another on the default host."""
-    host = LLM_HOST_2 if use_secondary else LLM_HOST
-    api_key = LLM_API_KEY_2 if use_secondary else LLM_API_KEY
+    host = LLM_HOST_2 if (use_secondary and LLM_HOST_2) else LLM_HOST
+    api_key = LLM_API_KEY_2 if (use_secondary and LLM_HOST_2) else LLM_API_KEY
 
     messages = []
     if system_prompt:

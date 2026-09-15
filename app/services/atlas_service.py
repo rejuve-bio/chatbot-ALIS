@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,6 +9,7 @@ from app.services.biology_service import (
 )
 from app.services.clinicaltrials_service import get_active_trials_for_compound
 from app.services.llm_service import call_llm
+from app.services.safety_check import check_compound_safety
 from datas.pc_chunks import PC_CHUNKS
 
 logger = logging.getLogger(__name__)
@@ -45,25 +45,45 @@ CRITICAL RULES:
 - Write 2-4 plain sentences, no headers, no bullet points, no markdown.
 """
 
-NOTE_SYSTEM_PROMPT = """
-You are writing one short clinical note per compound, for a structured
-JSON record in an "Investigational, preclinical evidence" list — NOT
-prose for a reader, a single caveat sentence attached to that compound's
-own data.
+def _format_drugage_finding(raw_evidence: list[dict]) -> str:
+    """States the actual per-study DrugAge result — species, dose, and lifespan effect — instead of a generic tier label."""
+    if not raw_evidence:
+        return "no per-study detail on file"
+    parts = []
+    for e in raw_evidence:
+        piece = e.get("species") or "unspecified species"
+        if e.get("gender"):
+            piece += f", {e['gender'].lower()}"
+        if e.get("dosage"):
+            piece += f" at {e['dosage']}"
+        pct = e.get("avg_lifespan_change_percent")
+        if pct not in (None, ""):
+            try:
+                pct_f = float(pct)
+                direction = "increased" if pct_f >= 0 else "decreased"
+                piece += f" — lifespan {direction} {abs(pct_f):.2f}%"
+            except (TypeError, ValueError):
+                piece += f" — lifespan change {pct}%"
+        parts.append(piece)
+    return "; ".join(parts)
 
-CRITICAL RULES:
-- Use ONLY the facts given for that specific compound. Never invent
-  anything, and never describe a different compound's evidence.
-- Every compound's evidence_tier is "animal_model" — always say so plainly.
-  If evipedia_found is true for that compound, also mention that a separate
-  human-evidence review exists for it; if false, say no human-evidence
-  review exists and it remains animal-only.
-- One short sentence per compound. No headers, no markdown, no bullet points
-  inside a note.
-- Reply with ONLY a JSON object in this exact format, nothing else:
-{"notes": [{"compound_name": "...", "note": "..."}, ...]}
-- Include every compound you were given, in the same order, exactly once.
-"""
+
+def _build_compound_note(c: dict) -> str:
+    raw_evidence = c.get("raw_evidence") or []
+    if c.get("source") == "ClinPGx" and not raw_evidence:
+        note = "Identified via a known drug-gene relationship (ClinPGx) to a gene linked to this disease — not a DrugAge longevity study."
+    else:
+        study_word = "study" if len(raw_evidence) == 1 else "studies"
+        note = f"DrugAge ({len(raw_evidence)} {study_word}): {_format_drugage_finding(raw_evidence)}."
+    if c.get("evipedia_found"):
+        note += (
+            " A separate human-evidence review also exists for this compound."
+            if c.get("evipedia_evidence_tier") == "human" else
+            " A separate Evipedia review exists too, but it's animal-model evidence as well."
+        )
+    elif c.get("source") != "ClinPGx":
+        note += " No human-evidence review exists for it — animal-only."
+    return note
 
 
 def get_mechanisms_for_pc_group(pc_group: str) -> tuple[list[str], list[str]]:
@@ -119,6 +139,7 @@ def _merge_evidence_lists(
             "pmids": [],
             "gene_level_grounding": c.get("gene_level_grounding", []),
             "active_trials": c.get("active_trials", []),
+            "safety_warning": c.get("safety_warning"),
         }
 
     new_evipedia = [h for h in human_evidence_direct if h["intervention_name"] not in by_name]
@@ -150,6 +171,7 @@ def _merge_evidence_lists(
                 "pmids": h.get("pmids", []),
                 "gene_level_grounding": gene_futures[name].result(),
                 "active_trials": trial_futures[name].result(),
+                "safety_warning": None,
             }
 
     for h in human_evidence_direct:
@@ -164,21 +186,23 @@ def _merge_evidence_lists(
 
     merged = list(by_name.values())
     for entry in merged:
-        count = 1
+        gene_score = 0
         for gene in entry["gene_level_grounding"]:
-            count += 1
-            count += sum(
+            gene_score += 1
+            gene_score += sum(
                 1 for field in ("human_aging_link", "model_organism_link",
                                  "senescence_effect", "senescence_expression")
                 if gene.get(field) is not None
             )
+        count = 1 + min(gene_score, 5)
         if entry["evidence_tier"] == "human":
             count += 2
         count += len(entry["active_trials"])
         entry["evidence_count"] = count
         entry["active_trials"] = [_trim_trial(t) for t in entry["active_trials"][:2]]
 
-    merged.sort(key=lambda e: e["evidence_count"], reverse=True)
+    # Human-tier evidence always outranks animal-only evidence
+    merged.sort(key=lambda e: (0 if e["evidence_tier"] == "human" else 1, -e["evidence_count"]))
     logger.info(f"_merge_evidence_lists | merged {len(merged)} entries | "
                 f"order={[(e['name'], e['evidence_count']) for e in merged]}")
     return merged
@@ -276,6 +300,10 @@ def _build_atlas_response_inner(
         c["compound_name"]: background_executor2.submit(get_human_evidence_for_compound, c["compound_name"])
         for c in compounds
     }
+    safety_futures = {
+        c["compound_name"]: background_executor2.submit(check_compound_safety, c["compound_name"], disease_name)
+        for c in compounds
+    }
     for c in compounds:
         evipedia_hit = evipedia_futures[c["compound_name"]].result()
         c["evipedia_found"] = evipedia_hit is not None
@@ -285,29 +313,23 @@ def _build_atlas_response_inner(
     logger.info(f"build_atlas_response | evipedia_found: "
                 f"{[c['compound_name'] for c in compounds if c['evipedia_found']]}")
 
-    note_prompt = f"""
-Write the note for each of these compounds, using ONLY the facts given:
-{json.dumps([{"compound_name": c["compound_name"], "evidence_tier": c["evidence_tier"],
-              "evipedia_found": c["evipedia_found"],
-              "evipedia_evidence_tier": c["evipedia_evidence_tier"]} for c in compounds], indent=2)}
-"""
-    logger.info(f"build_atlas_response | calling LLM for per-compound notes")
-    notes_by_compound = {}
-    try:
-        notes_response = call_llm(note_prompt, system_prompt=NOTE_SYSTEM_PROMPT)
-        match = re.search(r"\{.*\}", notes_response, re.DOTALL)
-        parsed = json.loads(match.group(0)) if match else {"notes": []}
-        notes_by_compound = {n["compound_name"]: n["note"] for n in parsed.get("notes", [])}
-        logger.info(f"build_atlas_response | notes received for: {list(notes_by_compound.keys())}")
-    except Exception as e:
-        logger.error(f"build_atlas_response | note generation failed, falling back to a plain "
-                     f"fact-based note per compound: {e}")
+    excluded = []
+    kept = []
     for c in compounds:
-        c["note"] = notes_by_compound.get(c["compound_name"]) or (
-            "Human evidence review exists separately for this compound (see evipedia_summary)."
-            if c["evipedia_found"] else
-            "Not validated in humans."
-        )
+        safety = safety_futures[c["compound_name"]].result()
+        if safety["verdict"] == "exclude":
+            excluded.append((c["compound_name"], safety["reason"]))
+            continue
+        if safety["verdict"] == "warn":
+            c["safety_warning"] = safety["reason"]
+        kept.append(c)
+    compounds = kept
+    if excluded:
+        logger.warning(f"build_atlas_response | safety check excluded: {excluded}")
+
+    for c in compounds:
+        c["note"] = _build_compound_note(c)
+    logger.info(f"build_atlas_response | notes built for: {[c['compound_name'] for c in compounds]}")
 
     for c in compounds:
         c["active_trials"] = trial_futures[c["compound_name"]].result()
@@ -347,11 +369,22 @@ name which ones have a direct human-evidence review (source: Evipedia,
 evidence_tier: human) and which are animal-model only, don't claim no
 human evidence exists if any entry above has has_human_review: true.
 """
+    def _safe_call_llm(*args, fallback: str, **kwargs) -> str:
+        try:
+            return call_llm(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"build_atlas_response | summary LLM call failed, using fallback text: {e}")
+            return fallback
+
     logger.info(f"build_atlas_response | calling LLM for synthesis + human-evidence summaries concurrently")
     with ThreadPoolExecutor(max_workers=2) as executor:
-        summary_future = executor.submit(call_llm, prompt, system_prompt=SUMMARY_SYSTEM_PROMPT)
+        summary_future = executor.submit(
+            _safe_call_llm, prompt, system_prompt=SUMMARY_SYSTEM_PROMPT,
+            fallback="Summary unavailable — see the evidence list below.",
+        )
         human_summary_future = executor.submit(
-            call_llm, human_prompt, system_prompt=HUMAN_EVIDENCE_SYSTEM_PROMPT, use_secondary=True
+            _safe_call_llm, human_prompt, system_prompt=HUMAN_EVIDENCE_SYSTEM_PROMPT, use_secondary=True,
+            fallback="Human-evidence summary unavailable — see each entry's evidence_tier below.",
         )
         summary = summary_future.result()
         human_evidence_summary = human_summary_future.result()
