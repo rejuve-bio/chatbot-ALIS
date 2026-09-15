@@ -24,7 +24,13 @@ from app.services.codebook import (
     is_questionnaire, DEMOGRAPHIC_CODES,
 )
 from app.services.memory import get_history, save_turn
-from app.services.glossary import match_glossary_question, needs_population_data, needs_biology_evidence
+from app.services.glossary import (
+    match_glossary_question, needs_population_data, needs_biology_evidence,
+    resolve_disease_for_evidence,
+)
+from app.services.atlas_service import (
+    build_atlas_response, find_pc_groups_for_disease, get_mechanisms_for_pc_group,
+)
 
 load_dotenv()
 
@@ -219,6 +225,7 @@ def build_context(
     check_biology_evidence: bool = True,
     include_biomarkers: bool = True,
     include_disease_risks: bool = True,
+    atlas_evidence: Optional[dict] = None,
 ) -> tuple[str, list[str], Optional[dict], Optional[list[str]]]:
     logger.info(f"Building context | patient_id: {patient_id} | pc_group: {pc_group}")
     if query_vector is None:
@@ -434,7 +441,27 @@ def build_context(
 
     resource = None
     biology_hits = []
-    if check_biology_evidence:
+    if atlas_evidence is not None:
+        evidence_list = atlas_evidence.get("evidence", [])
+        context_parts.append(
+            f"\n=== Investigational Evidence for {atlas_evidence.get('disease_name')} "
+            f"(ranked, safety-checked — not validated in humans unless evidence_tier is human) ==="
+        )
+        for e in evidence_list:
+            warning = f" | SAFETY WARNING: {e['safety_warning']}" if e.get("safety_warning") else ""
+            context_parts.append(
+                f"{e['name']} | source: {e['source']} | evidence_tier: {e['evidence_tier']}{warning} | "
+                f"{e.get('note', '')}"
+            )
+        if atlas_evidence.get("summary"):
+            context_parts.append(f"Summary: {atlas_evidence['summary']}")
+        if atlas_evidence.get("human_evidence_summary"):
+            context_parts.append(f"Human evidence summary: {atlas_evidence['human_evidence_summary']}")
+        sources.append("atlas_evidence")
+        resource = sorted({e.get("source") for e in evidence_list if e.get("source")})
+        logger.info(f"Atlas evidence used for chat | disease={atlas_evidence.get('disease_name')} | "
+                    f"compounds={[e['name'] for e in evidence_list]}")
+    elif check_biology_evidence:
         from app.services.biology_service import ATLAS_RESOURCES_FOR_CHAT
 
         with ThreadPoolExecutor(max_workers=len(ATLAS_RESOURCES_FOR_CHAT)) as executor:
@@ -443,22 +470,22 @@ def build_context(
                 for collection in ATLAS_RESOURCES_FOR_CHAT
             ]
             biology_hits = [hit for f in futures for hit in f.result()]
-        logger.info(f"Investigational biology search | collections={ATLAS_RESOURCES_FOR_CHAT} | "
-                    f"total_hits={len(biology_hits)}")
+        logger.info(f"Investigational biology search (no disease resolved, raw fallback) | "
+                    f"collections={ATLAS_RESOURCES_FOR_CHAT} | total_hits={len(biology_hits)}")
+
+        if biology_hits:
+            context_parts.append("\n=== Investigational, Preclinical Evidence (not validated in humans unless noted) ===")
+            for hit in biology_hits:
+                name = hit.get("name") or hit.get("compound_name") or "unknown"
+                context_parts.append(
+                    f"{name} | source: {hit.get('source')} | evidence_tier: {hit.get('evidence_tier')} | "
+                    f"{hit.get('raw_text', '')}"
+                )
+            sources.append("biology_evidence")
+            resource = sorted({hit.get("source") for hit in biology_hits if hit.get("source")})
+            logger.info(f"Resource key set from biology collections: {resource}")
     else:
         logger.info("Skipping investigational biology search — question not relevant to compounds/genes/evidence")
-
-    if biology_hits:
-        context_parts.append("\n=== Investigational, Preclinical Evidence (not validated in humans unless noted) ===")
-        for hit in biology_hits:
-            name = hit.get("name") or hit.get("compound_name") or "unknown"
-            context_parts.append(
-                f"{name} | source: {hit.get('source')} | evidence_tier: {hit.get('evidence_tier')} | "
-                f"{hit.get('raw_text', '')}"
-            )
-        sources.append("biology_evidence")
-        resource = sorted({hit.get("source") for hit in biology_hits if hit.get("source")})
-        logger.info(f"Resource key set from biology collections: {resource}")
 
     context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
     logger.info(f"Context built after searching pc knowledge {context_str}")
@@ -593,13 +620,58 @@ def rag_query(
     logger.info(f"Longitudinal decision | needs={needs_longitudinal} | biomarkers={biomarkers} | pcs={pcs}")
 
     # build_context() must stay free of its own call_llm() calls — it runs
-    # concurrently with fetch_longitudinal() below (commit 1a3157c).
+    # concurrently with fetch_longitudinal() below (commit 1a3157c). So the
     check_biology = needs_biology_evidence(question)
+
+    atlas_evidence = None
+    if check_biology:
+        patient_for_disease = None
+        if patient_id and token:
+            try:
+                patient_for_disease = fetch_and_store_patient(patient_id, token=token)
+            except Exception as e:
+                logger.warning(f"rag_query | couldn't fetch patient for disease resolution: {e}")
+
+        known_diseases = [r["disease_name"] for r in (patient_for_disease or {}).get("risks", [])]
+        disease_name = resolve_disease_for_evidence(question, prior_question, known_diseases or None)
+
+        if disease_name:
+            gender_suffix = None
+            pc_groups = []
+            if patient_for_disease:
+                gender = (patient_for_disease.get("gender") or "").lower()
+                gender_suffix = "F" if gender == "female" else "M"
+                risk_match = next(
+                    (r for r in patient_for_disease.get("risks", [])
+                     if r.get("disease_name", "").lower() == disease_name.lower()), None
+                )
+                if risk_match:
+                    pc_groups = [f"{pc}{gender_suffix}" for pc in risk_match.get("contributing_pcs", [])]
+            if not pc_groups:
+                pc_groups = find_pc_groups_for_disease(disease_name, gender_suffix)
+
+            mechanisms = []
+            for pc in pc_groups:
+                m, _ = get_mechanisms_for_pc_group(pc)
+                for tag in m:
+                    if tag not in mechanisms:
+                        mechanisms.append(tag)
+
+            if mechanisms:
+                try:
+                    atlas_evidence = build_atlas_response(
+                        mechanisms, pc_group=",".join(pc_groups), disease_name=disease_name
+                    )
+                except Exception as e:
+                    logger.error(f"rag_query | Atlas evidence build failed for {disease_name!r}: {e}")
+            else:
+                logger.info(f"rag_query | resolved disease {disease_name!r} but no PC groups/mechanisms found "
+                            f"for it — falling back to raw biology search")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         context_future = executor.submit(
             build_context, question, patient_id, pc_group, token, query_vector,
-            check_biology, needs_full_biomarkers, needs_disease_risks
+            check_biology, needs_full_biomarkers, needs_disease_risks, atlas_evidence
         )
         longitudinal_future = executor.submit(
             fetch_longitudinal,

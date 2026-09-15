@@ -28,18 +28,25 @@ CRITICAL RULES:
 """
 
 HUMAN_EVIDENCE_SYSTEM_PROMPT = """
-You are summarizing the human-evidence picture for a list of compounds
-that come from two different sources: some (source: DrugAge) were only
-ever studied in animals and have no direct human-evidence review; others
-(source: Evipedia) already have a direct, real human-evidence review.
+You are summarizing the human-evidence picture for a list of compounds from
+three possible sources: DrugAge (always animal-only — a lifespan study in a
+model organism, never human evidence), Evipedia (a human-reviewed narrative
+write-up, when evidence_tier is "human"), and ClinPGx (a real clinical
+drug-gene relationship for an approved, prescribed drug — evidence_tier
+"human" here means a real prescribed medication, not an Evipedia review).
 
 CRITICAL RULES:
+- The evidence_tier field is the only thing that tells you whether a
+  compound has human evidence — NOT the source name. A ClinPGx entry with
+  evidence_tier "human" has just as real human evidence as an Evipedia one;
+  it means it's a known, clinically-used drug, not an animal-only finding.
 - Cover EVERY entry in the list given to you — not just one or a few.
-- If has_human_review is true (source is Evipedia), say so plainly and
-  summarize what its interactions_and_contraindications field says — do
-  NOT claim "no human evidence exists" for these, that would be false.
-- If has_human_review is false (source is DrugAge only), state plainly
-  that it remains animal-only evidence with no human-evidence review.
+- If evidence_tier is "human", say so plainly — do NOT claim "no human
+  evidence exists" or "animal-only" for these, that would be false,
+  regardless of which source (Evipedia or ClinPGx) it came from. If it also
+  has interactions_and_contraindications text, summarize what that says.
+- If evidence_tier is "animal_model", state plainly that it remains
+  animal-only evidence with no human-evidence review.
 - Use ONLY the findings given to you. Never invent a compound or a claim.
 - Never upgrade animal-only evidence to "proven in humans."
 - Write 2-4 plain sentences, no headers, no bullet points, no markdown.
@@ -102,6 +109,22 @@ def get_mechanisms_for_pc_group(pc_group: str) -> tuple[list[str], list[str]]:
     logger.info(f"get_mechanisms_for_pc_group | pc_group={pc_group} | mechanisms={mechanisms} | "
                 f"diseases_count={len(diseases)}")
     return mechanisms, diseases
+
+
+def find_pc_groups_for_disease(disease_name: str, gender_suffix: str | None = None) -> list[str]:
+    """Reverse of get_mechanisms_for_pc_group — which PC groups list this disease. Case-insensitive
+    substring match, since a disease can be phrased differently in PC_CHUNKS than in a chat message
+    (e.g. "Cardiovascular disease including congestive cardiac failure" vs "heart failure")."""
+    disease_lower = disease_name.lower()
+    matches: list[str] = []
+    for chunk in PC_CHUNKS:
+        pc_group = chunk.get("pc_group", "")
+        if gender_suffix and not pc_group.endswith(gender_suffix):
+            continue
+        diseases = [d.lower() for d in chunk.get("diseases", [])]
+        if any(disease_lower in d or d in disease_lower for d in diseases) and pc_group not in matches:
+            matches.append(pc_group)
+    return matches
 
 
 def _trim_trial(t: dict) -> dict:
@@ -356,18 +379,18 @@ Write the 2-3 sentence clinical framing note now.
 """
     human_prompt = f"""
 All evidence identified for this risk area, ranked strongest-to-weakest by
-evidence_count, tagged by source (DrugAge = animal-model only, Evipedia =
-has a direct human-evidence review) and evidence_tier ("human" or
-"animal_model"):
+evidence_count. evidence_tier ("human" or "animal_model") is the only
+reliable signal for whether a compound has human evidence — source alone
+does not tell you that, since both Evipedia and ClinPGx entries can be
+"human" tier:
 {json.dumps([{"name": e["name"], "source": e["source"], "evidence_tier": e["evidence_tier"],
-              "has_human_review": e["source"] == "Evipedia",
               "interactions_and_contraindications": e["interactions_and_contraindications"]}
              for e in evidence], indent=2)}
 
 Write the human-evidence summary now, covering ALL entries listed above —
-name which ones have a direct human-evidence review (source: Evipedia,
-evidence_tier: human) and which are animal-model only, don't claim no
-human evidence exists if any entry above has has_human_review: true.
+name which ones have evidence_tier "human" (real human evidence, regardless
+of source) and which are "animal_model" only. Don't claim no human evidence
+exists for any entry whose evidence_tier is "human".
 """
     def _safe_call_llm(*args, fallback: str, **kwargs) -> str:
         try:

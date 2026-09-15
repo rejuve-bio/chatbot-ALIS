@@ -225,3 +225,37 @@ evidence, {NOT_RELEVANT} if it isn't.
     result = NOT_RELEVANT not in reply
     logger.info(f"glossary | needs_biology_evidence({question!r}) = {result}")
     return result
+
+
+def resolve_disease_for_evidence(
+    question: str, prior_question: str | None = None, known_diseases: list[str] | None = None
+) -> str | None:
+    """Which disease/condition an investigational-evidence question is actually about — resolves
+    a pronoun reference ("this disease") against the prior message, never invents one."""
+    known = f"\nThis patient's known disease risks: {', '.join(known_diseases)}." if known_diseases else ""
+    prompt = f"""
+A clinician asked a question about investigational compounds, genes, or evidence.
+Determine which specific disease or condition it's actually about.
+
+Current message: {question!r}
+Previous message in this conversation: {prior_question!r}
+{known}
+
+RULES:
+- If the current message names a disease/condition directly, return that.
+- If it refers back with a pronoun ("this disease", "it", "that condition"), resolve it
+  using the previous message only — never guess or assume one from the known-diseases list
+  unless the question or previous message actually points to it.
+- If no specific disease can be identified this way, reply with exactly: NONE
+- Reply with ONLY the disease name, or NONE. No explanation, no punctuation.
+"""
+    try:
+        reply = call_llm(question, system_prompt=prompt)
+    except Exception as e:
+        logger.warning(f"glossary | disease resolution failed, treating as NONE: {e}")
+        return None
+    reply = (reply or "").strip()
+    if not reply or reply.upper() == "NONE":
+        return None
+    logger.info(f"glossary | resolve_disease_for_evidence({question!r}, prior={prior_question!r}) = {reply!r}")
+    return reply
