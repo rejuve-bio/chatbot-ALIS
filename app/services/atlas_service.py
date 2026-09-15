@@ -10,7 +10,7 @@ from app.services.biology_service import (
 from app.services.clinicaltrials_service import get_active_trials_for_compound
 from app.services.llm_service import call_llm
 from app.services.safety_check import check_compound_safety
-from datas.pc_chunks import PC_CHUNKS
+from data.pc_chunks import PC_CHUNKS
 
 logger = logging.getLogger(__name__)
 

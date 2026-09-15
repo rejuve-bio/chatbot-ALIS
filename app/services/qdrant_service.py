@@ -9,7 +9,7 @@ from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue
 )
-from datas.pc_chunks import PC_CHUNKS
+from data.pc_chunks import PC_CHUNKS
 
 load_dotenv()
 
