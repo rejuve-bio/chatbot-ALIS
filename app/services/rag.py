@@ -16,8 +16,8 @@ from app.services.backend_api import fetch_patient, fetch_longitudinal, fetch_al
 from app.services.ingestion.excel_parser import parse_excel
 from app.services.ingestion.pdf_parser import parse_pdf
 from app.services.longitudinal import (
-    _extract_variables_with_llm, _format_longitudinal_context,
-    _format_date, LONGITUDINAL_SYSTEM_PROMPT,
+    _extract_variables_with_llm, _format_longitudinal_addendum,
+    _format_date,
 )
 from app.services.codebook import (
     get_force_included_variables, get_label, decode_questionnaire_value,
@@ -59,12 +59,13 @@ SCOPE:
 FORMATTING — use the simplest format that fits:
 - Single value or direct fact: one or two plain sentences. No table.
 - Multiple values side by side (PC rankings, biomarker comparison, patient list): markdown table.
-- PC ranking (single patient): if the question asks for a specific number of PCs (e.g. "top 3", "highest 3", "three"), show only that many rows from the PC Contributions Table sorted by absolute contribution. Otherwise output the full table. End with one sentence on the most urgent PC.
+- PC ranking (single patient): if the question names a direction — "raising/accelerating/increasing aging" (positive rows only) or "protective/slowing/decreasing aging" (negative rows only) — filter the PC Contributions Table to that direction FIRST, then take the requested count from what's left, sorted by magnitude. Never fill a requested count with a row of the wrong direction — if fewer rows match that direction than the count asked for, list only the ones that do and say plainly that no more exist in this direction (e.g. "only 2 PCs show an aging-accelerating contribution"). If the question asks for a count with no direction specified, show that many rows sorted by absolute contribution regardless of direction. If it asks for neither a count nor a direction, output the full table. End with one sentence on the most urgent PC.
 - PC ranking (population / All Patients Summary): aggregate PCs across all patients by summing absolute contributions or counting frequency. If the question specifies a number (e.g. "3 most significant"), return ONLY that many rows — no more. Always end with one sentence on the top-ranked PC.
 - PC comparison (e.g. PC1M vs PC1F): markdown table (| Dimension | PC_A | PC_B |).
 - Life events: only use a table if the clinician explicitly asks to list events; otherwise mention them inline.
 - Separate sections: use ## headers. Lists of observations: use bullet points.
 - Broad biomarker requests with nothing specific named (e.g. "what are this patient's biomarkers", "show me their labs"): do NOT retype every line from the context verbatim — that's a wall of text, not an answer. Lead with anything abnormal or flagged ("Yes" questionnaire answers, out-of-range values), then a handful of key vitals (blood pressure, BMI, glucose). Never omit an abnormal or clinically notable value from this summary. End by noting more measured values exist and offering to list a specific one or the full set if the clinician wants it.
+- Per-visit history (a "Biomarker Time Series", "PC Values Over Time", or "Biological Age Over Time" section, when present in the context): for a variable with 2+ time points, use a markdown table (Date | Value | Change) followed by one "Trend:" sentence on direction and magnitude. For a variable with only one data point, state it as plain text ("X: value as of DATE — insufficient history to determine a trend") instead of a table. This section answers "how has X changed over time" questions; it stands alongside the rest of the context (PC Contributions Table, disease risks, etc.), not in place of it — use whichever parts of the context the question actually calls for, together if it asks for both.
 
 CLINICAL RULES:
 - PC contribution values must always include direction: positive = aging faster, negative = protective.
@@ -683,25 +684,22 @@ def rag_query(
 
     context, sources, patient_payload, resource = context_future.result()
 
+    raw_markdown = False
     if longitudinal_future:
         longitudinal_data = longitudinal_future.result()
         if longitudinal_data:
-            long_context = _format_longitudinal_context(
+            addendum = _format_longitudinal_addendum(
                 question=question,
                 data=longitudinal_data,
                 biomarkers_requested=biomarkers,
                 pcs_requested=pcs,
-                patient_payload=patient_payload,
             )
+            context = f"{context}\n\n{addendum}"
             sources.append(f"longitudinal:{patient_id}")
-            prompt = build_prompt(question, long_context)
-            answer = call_llm(prompt, system_prompt=LONGITUDINAL_SYSTEM_PROMPT, raw_markdown=True, history=history)
-            if token:
-                save_turn(token, question, answer)
-            return answer, sources, None
+            raw_markdown = True
 
     prompt = build_prompt(question, context)
-    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT, history=history)
+    answer = call_llm(prompt, system_prompt=SYSTEM_PROMPT, raw_markdown=raw_markdown, history=history)
     if token:
         save_turn(token, question, answer)
     return answer, sources, resource

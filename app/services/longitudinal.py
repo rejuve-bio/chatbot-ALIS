@@ -78,44 +78,62 @@ def _extract_variables_with_llm(
     if prior_question:
         context_line = f"\nPrevious question (for context): {prior_question}\n"
 
-    prompt = f"""You are deciding whether this clinical question needs its own
-extra data fetched from the patient's longitudinal record, on top of what's
-already available.
+    prompt = f"""Two different data sources could answer parts of this clinical
+question. Your only job is to pick correctly between them — you are not
+answering the question yourself.
 
-Available biomarker variables:
+SOURCE 1 — the main patient context (already loaded, already in front of
+you elsewhere in this conversation, costs nothing extra to use):
+- Patient Profile: chronological age, biological age, delta.
+- PC Contributions Table: EVERY one of this patient's PCs that has a
+  nonzero contribution, each already listed with its exact value AND
+  direction (positive = aging faster, negative = protective), already
+  sorted by size. Any question that ranks, filters, compares, or asks
+  "which/how many/top/most/highest/lowest" PCs by direction or magnitude
+  is fully answered from this table alone — nothing needs to be fetched
+  for it, no matter what numbers or counts appear in the question's
+  wording (a "3" in "the 3 pcs raising aging" is not a PC number; it's
+  asking for 3 rows out of this table, filtered by direction).
+- Biomarkers section: every lab/vital/questionnaire value this patient
+  has, current snapshot only (~70 lines).
+- Disease Risks section: every disease risk with its evidence score.
+- Life Events.
+
+Available biomarker variables (their codes, for reference only —
+these are already covered by SOURCE 1 above for their current value):
 {var_list}
 
-Available PC values: PC1 through PC59
+SOURCE 2 — the longitudinal fetch (what you are deciding whether to
+trigger): adds exactly one thing SOURCE 1 doesn't have — a per-visit
+HISTORY table, across past dates, for ONE variable that the question
+already names explicitly by its own code or label (e.g. "PC32", "blood
+pressure", "glucose"). It adds no new PCs, no new biomarkers, no
+rankings, and no direction/comparison info beyond what SOURCE 1 already
+has — it only shows how one already-named variable's value moved across
+visits.
 {context_line}
 Clinical question: {question}
 
-The patient's current biomarker values, PC contributions, and disease risks
-are ALREADY included elsewhere in this conversation's context. You are not
-answering the question — only deciding whether fetching a SPECIFIC named
-variable's own record from the longitudinal API is genuinely needed beyond
-that.
+DECISION: does answering this question require SOURCE 2 — i.e. does it
+name one specific variable (a biomarker or a PC, by its own code/label)
+and ask how that one variable's value changed across dates/visits ("over
+time", "trend", "history", "since", "at each visit", "from X to Y")? If
+so, list only that variable's code.
 
-The principle: only select a variable if the question calls out that exact
-variable by name — a named biomarker (blood pressure, glucose, pulse...) or
-a specific PC (PC1, PC32...) — whether it's asking for that variable's
-current value or how it changed over time. If the question is broad or
-general instead — "what are the biomarkers," "show all PCs," an overview,
-a diagnosis/history question ("does this patient have asthma"), a ranking
-("top 3 PCs") — return EMPTY lists for both. None of those name a specific
-variable, and the broader information they need is already in the main
-patient context; this step exists only for named, specific lookups.
-Aging/delta/biological-age questions also return empty — those come from
-clock_results automatically, not from this lookup.
+If instead the question is broad, general, a ranking/filter across many
+PCs or biomarkers, a diagnosis/history check, or an overview — return
+EMPTY lists for both, even if it mentions specific numbers or counts.
+SOURCE 1 already answers all of those. Aging/delta/biological-age
+questions also return empty — those come from clock_results
+automatically, not from either source above.
 
-When genuinely unsure, return empty lists — the main context already
-covers general and single-value lookups; this is only for the narrower
-case of a clearly named variable.
+When genuinely unsure, return empty lists — SOURCE 1 already covers
+general and single-value lookups; SOURCE 2 is only for the narrower case
+of a clearly named variable's own history across visits.
 
-Separately: the patient's context ALSO has a full "Biomarkers" section
-(every lab/vital/questionnaire value, ~70 lines) and a full "Disease
-Risks" section (every disease risk with evidence score and mechanisms).
-Both get included by default, but reading through them costs real time
-for questions that don't need them. Decide honestly whether THIS question
+Separately: SOURCE 1's "Biomarkers" section and "Disease Risks" section
+get included by default, but reading through them costs real time for
+questions that don't need them. Decide honestly whether THIS question
 needs each one:
 - needs_full_biomarkers: true if the question is actually about the
   patient's lab values, vitals, medical history/questionnaire answers,
@@ -156,6 +174,10 @@ Maximum 5 biomarker codes, maximum 5 PC codes — never list all PCs.
         terms = parsed.get("terms_identified", [])
         needs_full_biomarkers = parsed.get("needs_full_biomarkers", True)
         needs_disease_risks = parsed.get("needs_disease_risks", True)
+
+        mentioned = set(re.findall(r"pc\s*0*(\d{1,2})\b", question, re.IGNORECASE))
+        pcs = [pc for pc in pcs if re.sub(r"\D", "", pc).lstrip("0") in mentioned]
+
         logger.info(
             f"LLM variable extraction | terms={terms} | "
             f"biomarkers={biomarkers} | pcs={pcs} | "
@@ -246,6 +268,24 @@ def _format_longitudinal_context(
         if q_lines:
             parts.append("\n=== Patient Questionnaire (Medical History) ===\n" + "\n".join(q_lines))
 
+    parts.extend(_time_series_parts(question, data, biomarkers_requested, pcs_requested))
+    parts.append(f"\n=== Clinician Question ===\n{question}")
+
+    return "\n".join(parts)
+
+
+def _time_series_parts(
+    question: str,
+    data: dict,
+    biomarkers_requested: list[str],
+    pcs_requested: list[str],
+) -> list[str]:
+    """The per-visit history tables a longitudinal fetch adds — everything
+    _format_longitudinal_context has beyond the patient profile/questionnaire,
+    which a caller that already has those from the main patient context
+    (see _format_longitudinal_addendum) doesn't need duplicated."""
+    parts = []
+
     biomarker_data = data.get("biomarkers", {})
     if biomarker_data:
         parts.append("=== Biomarker Time Series ===")
@@ -300,9 +340,21 @@ def _format_longitudinal_context(
     for pc in pcs_requested:
         parts.append(f"  {pc}")
 
-    parts.append(f"\n=== Clinician Question ===\n{question}")
+    return parts
 
-    return "\n".join(parts)
+
+def _format_longitudinal_addendum(
+    question: str,
+    data: dict,
+    biomarkers_requested: list[str],
+    pcs_requested: list[str],
+) -> str:
+    """History tables to append to the main patient context, when a question
+    needs both — e.g. a PC ranking that also asks how one of those PCs
+    trended over time. The main context already has the patient profile,
+    full PC Contributions Table, biomarkers, and disease risks; this adds
+    only what a named-variable longitudinal fetch has beyond that."""
+    return "\n".join(_time_series_parts(question, data, biomarkers_requested, pcs_requested))
 
 
 def answer_longitudinal_question(
