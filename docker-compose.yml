@@ -6,20 +6,33 @@ services:
     container_name: qdrant-alis
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6335:6333"
+      - "127.0.0.1:${QDRANT_PORT}:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      - default
 
   api:
     build: .
     container_name: linage2-api
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8082:8082"
+      - "127.0.0.1:${API_PORT}:8082"
     env_file:
       - .env
+    volumes:
+      - atlas_store:/app/atlas_store
     depends_on:
       - qdrant-alis
-
+    networks:
+      - default
+      - alis-backend
 volumes:
   qdrant_data:
+  atlas_store:
+
+networks:
+  default:
+  alis-backend:
+    external: true
+    name: ${ALIS_BACKEND_NETWORK} 
