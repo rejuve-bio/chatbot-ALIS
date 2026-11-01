@@ -10,6 +10,8 @@ from app.services.llm_service import embed_text
 
 logger = logging.getLogger(__name__)
 
+from app.services.atlas_service import combined_mechanisms
+
 router = APIRouter()
 
 
@@ -40,88 +42,76 @@ def get_patients():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _combined_mechanisms(pc_groups: List[str]) -> tuple[list[str], list[str]]:
-    """Merges mechanisms + diseases across multiple PC groups — one disease can be driven by several PCs at once."""
-    from app.services.atlas_service import get_mechanisms_for_pc_group
-    mechanisms, diseases = [], []
-    for pc_group in pc_groups:
-        m, d = get_mechanisms_for_pc_group(pc_group)
-        for tag in m:
-            if tag not in mechanisms:
-                mechanisms.append(tag)
-        for dis in d:
-            if dis not in diseases:
-                diseases.append(dis)
-    return mechanisms, diseases
+def _fetch_patient_from_alis(patient_id: str, authorization: str) -> dict:
+    """For a patient the precompute hasn't saved yet (added since its last run)."""
+    from app.services.backend_api import BackendAuthError, fetch_patient
+    try:
+        patient_data = fetch_patient(patient_id, token=authorization, raise_auth_errors=True)
+    except BackendAuthError:
+        logger.warning(f"Atlas | ALIS API rejected the token for patient {patient_id}")
+        raise HTTPException(status_code=401, detail="Token expired or not authorized for this patient")
+    if not patient_data:
+        logger.error(f"Atlas | could not fetch patient {patient_id} from ALIS API")
+        raise HTTPException(status_code=502, detail=f"Could not fetch patient {patient_id} from ALIS API")
+    return patient_data
 
 
 @router.get("/atlas/{patient_id}/risk")
-async def get_atlas_for_risk(
+def get_atlas_for_risk(
     patient_id: str,
     disease: Optional[List[str]] = Query(None),
     pc: Optional[List[str]] = Query(None),
     authorization: str = Header(None),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    if not disease and not pc:
-        raise HTTPException(status_code=400, detail="Provide at least one of: disease, pc")
+    """Intervention Atlas for the given risk(s) of a patient; with neither disease nor pc, for all of them."""
+    from app.services.auth import verify_token
+    claims = verify_token(authorization)
 
-    logger.info(f"Atlas request (specific risk(s)) | patient_id={patient_id} | disease={disease} | pc={pc}")
+    logger.info(f"Atlas request | patient_id={patient_id} | disease={disease or 'all risks'} | pc={pc}")
 
-    from app.services.atlas_service import build_atlas_response
+    from app.services.atlas_v2 import build_risk_area
 
     if pc:
-        mechanisms, diseases = _combined_mechanisms(pc)
+        mechanisms, diseases = combined_mechanisms(pc)
         if not mechanisms:
             raise HTTPException(status_code=404, detail=f"No mechanism data found for pc_group(s): {pc}")
         disease_name = (disease[0] if disease else None) or (diseases[0] if diseases else None)
-        result = build_atlas_response(mechanisms, pc_group=",".join(pc), disease_name=disease_name)
-        result["pc_groups"] = pc
-        logger.info(f"Atlas | patient={patient_id} | response ready (explicit pc override)")
-        return {"patient_id": patient_id, "risk_areas": [result]}
+        logger.info(f"Atlas | patient={patient_id} | explicit pc override")
+        return {"patient_id": patient_id, "risk_areas": [build_risk_area(disease_name, pc, mechanisms)]}
 
-    from app.services.backend_api import fetch_patient
-    patient_data = fetch_patient(patient_id, token=authorization)
-    if not patient_data:
-        logger.error(f"Atlas | could not fetch patient {patient_id} from ALIS API")
-        raise HTTPException(status_code=502, detail=f"Could not fetch patient {patient_id} from ALIS API")
+    from app.services import atlas_store
+    from app.services.auth import check_clinic
+    patient_data = atlas_store.get_patient(patient_id)
+    if patient_data:
+        check_clinic(claims, patient_data, patient_id)
+    else:
+        patient_data = _fetch_patient_from_alis(patient_id, authorization)
 
-    gender = (patient_data.get("gender") or "").lower()
-    suffix = "F" if gender == "female" else "M"
-    risks_by_name = {r.get("disease_name"): r for r in patient_data.get("risks", [])}
-
+    suffix = "F" if (patient_data.get("gender") or "").lower() == "female" else "M"
+    risks_by_name = {r.get("disease_name"): r for r in patient_data.get("risks", []) if r.get("disease_name")}
+    if not disease:
+        disease = list(risks_by_name)
+        if not disease:
+            return {"patient_id": patient_id, "risk_areas": []}
     not_found = [d for d in disease if d not in risks_by_name]
     if not_found:
         logger.warning(f"Atlas | disease(s) not found in patient {patient_id}'s risks: {not_found}")
         raise HTTPException(status_code=404, detail=f"Disease(s) not found in this patient's risks: {not_found}")
 
     def _build_one(disease_name: str) -> dict:
-        risk = risks_by_name[disease_name]
-        pc_groups = [f"{pc_num}{suffix}" for pc_num in risk.get("contributing_pcs", [])]
-        mechanisms, _ = _combined_mechanisms(pc_groups)
-        if not mechanisms:
-            raise HTTPException(status_code=404, detail=f"No mechanism data found for disease '{disease_name}'")
-        result = build_atlas_response(mechanisms, pc_group=",".join(pc_groups), disease_name=disease_name)
-        result["pc_groups"] = pc_groups
-        result["evidence_score"] = risk.get("evidence_score")
-        return result
+        pc_groups = [f"{pc_num}{suffix}" for pc_num in risks_by_name[disease_name].get("contributing_pcs", [])]
+        return build_risk_area(disease_name, pc_groups)
 
-    if len(disease) == 1:
-        risk_areas = [_build_one(disease[0])]
-    else:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(8, len(disease))) as executor:
-            risk_areas = list(executor.map(_build_one, disease))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(disease))) as executor:
+        risk_areas = list(executor.map(_build_one, disease))
 
-    logger.info(f"Atlas | patient={patient_id} | built {len(risk_areas)} requested risk area(s)")
+    logger.info(f"Atlas | patient={patient_id} | built {len(risk_areas)} risk area(s)")
     return {"patient_id": patient_id, "risk_areas": risk_areas}
 
 
-# TODO: GET /atlas/{patient_id} (all-diseases dashboard endpoint)
-
 @router.post("/patients/resync")
-async def resync_patients(authorization: str = Header(None)):
+def resync_patients(authorization: str = Header(None)):
     """Re-fetch all patients from ALIS API and update Qdrant with latest data (names, events, biomarkers)."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header is required")
@@ -145,7 +135,7 @@ async def resync_patients(authorization: str = Header(None)):
 
 
 @router.post("/chat")
-async def chat(
+def chat(
     message: str = Form(...),
     patient_id: Optional[str] = Form(None),
     pc_group: Optional[str] = Form(None),
