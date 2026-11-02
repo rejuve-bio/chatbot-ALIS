@@ -1,11 +1,11 @@
 """
 Mechanism -> pathway mapping to Gene Ontology (GO) biological processes and Reactome pathways.
 
-Source: Saulo's pathway table (pathway_go_reactome_mapping.csv, October 2026), which maps every
+Source: the reviewed pathway table (pathway_go_reactome_mapping.csv, October 2026), which maps every
 pathway term of the LinAge2 mechanism categories to GO and Reactome. Only rows rated High or
 Medium are kept; Low and no-match rows (e.g. AMPK activation, tau pathology, mitochondrial
 dysfunction, cardiac remodeling, tumor suppressor signaling, tissue remodeling) are left out.
-Still under review by Saulo and Michael — update this file when the table changes.
+Still under review; update this file when the table changes.
 
 Per row: the pathway term, its GO biological-process IDs, and its Reactome pathway (or None when
 only GO matched).
