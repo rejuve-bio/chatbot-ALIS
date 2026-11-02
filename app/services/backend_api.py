@@ -8,29 +8,59 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-ALIS_API_URL = os.getenv("ALIS_API_URL", "http://37.27.231.93:5001")
+ALIS_API_URL = os.getenv("ALIS_API_URL")
 
 
+ALIS_SERVICE_KEY = os.getenv("ALIS_SERVICE_KEY")
 
-def fetch_patient(patient_uuid: str, token: str) -> dict | None:
+
+def fetch_all_patient_risks(updated_since: str | None = None) -> list[dict]:
+    """Every patient's gender and risks (same shape as GET /patients/{id}), without a user token."""
+    if not ALIS_SERVICE_KEY:
+        raise RuntimeError("ALIS_SERVICE_KEY is not set")
+    url = f"{ALIS_API_URL}/internal/atlas/patients/risks"
+    items, page = [], 1
+    while True:
+        params = {"page": page, "size": 1000}
+        if updated_since:
+            params["updated_since"] = updated_since
+        response = httpx.get(url, params=params, headers={"X-Service-Key": ALIS_SERVICE_KEY}, timeout=60.0)
+        response.raise_for_status()
+        data = response.json()
+        items.extend(data.get("items", []))
+        if page >= data.get("total_pages", 1):
+            break
+        page += 1
+    logger.info(f"Fetched risks for {len(items)} patients from ALIS internal API")
+    return items
+
+
+class BackendAuthError(Exception):
+    """The ALIS API rejected the caller's token (expired or not allowed)."""
+
+
+def fetch_patient(patient_uuid: str, token: str, raise_auth_errors: bool = False) -> dict | None:
     url = f"{ALIS_API_URL}/patients/{patient_uuid}"
     headers = {"Content-Type": "application/json"}
     if token:
         if not token.lower().startswith("bearer "):
             token = f"Bearer {token}"
         headers["Authorization"] = token
-    logger.info(f"Sending Authorization header: {headers.get('Authorization')}")
     logger.info(f"Fetching patient from ALIS API: {url}")
     try:
         response = httpx.get(url, headers=headers, timeout=30.0)
-        
+
         if response.status_code == 404:
             logger.warning(f"Patient {patient_uuid} not found in ALIS API")
             return None
+        if response.status_code in (401, 403) and raise_auth_errors:
+            raise BackendAuthError(f"ALIS API returned {response.status_code} for patient {patient_uuid}")
         response.raise_for_status()
         data = response.json()
-        logger.info(f"Successfully fetched patient {patient_uuid} | API response: {data}")
+        logger.info(f"Successfully fetched patient {patient_uuid}")
         return data
+    except BackendAuthError:
+        raise
     except Exception as e:
         logger.error(f"Failed to fetch patient {patient_uuid}: {e}")
         return None
@@ -42,8 +72,7 @@ def fetch_all_patients(token) -> list[dict]:
     if token:
         if not token.lower().startswith("bearer "):
             token = f"Bearer {token}"
-        headers["Authorization"] = token 
-    logger.info(f"Sending Authorization header: {headers.get('Authorization')}")
+        headers["Authorization"] = token
     logger.info(f"Fetching all patients from ALIS API: {url}")
     try:
         response = httpx.get(url, headers=headers, timeout=30.0)
@@ -78,9 +107,7 @@ def fetch_biomarker_data_latest(patient_id: str, token: str) -> dict | None:
             if not data:
                 return None
             data = data[-1]
-        _q_prefixes = ("BPQ", "DIQ", "MCQ", "KIQ", "HUQ", "OSQ", "PFQ")
-        q_codes = {k: v for k, v in data.items() if k.startswith(_q_prefixes)}
-        logger.info(f"biomarker-data/latest questionnaire fields for {patient_id}: {q_codes}")
+        logger.info(f"Latest biomarker data fetched for {patient_id} | {len(data)} field(s)")
         return data
     except Exception as e:
         logger.error(f"Failed to fetch biomarker data for {patient_id}: {e}")
@@ -124,7 +151,7 @@ def fetch_longitudinal(
             return None
         response.raise_for_status()
         data = response.json()
-        logger.info(f"Longitudinal data fetched successfully for {patient_id} {data}")
+        logger.info(f"Longitudinal data fetched successfully for {patient_id}")
         return data
     except Exception as e:
         logger.error(f"Failed to fetch longitudinal data for {patient_id}: {e}")
