@@ -425,3 +425,17 @@ exists for any entry whose evidence_tier is "human".
     }
     logger.info(f"build_atlas_response | done | evidence={[e['name'] for e in evidence]}")
     return response
+
+
+def combined_mechanisms(pc_groups: list[str]) -> tuple[list[str], list[str]]:
+    """Merges mechanisms + diseases across multiple PC groups — one disease can be driven by several PCs at once."""
+    mechanisms, diseases = [], []
+    for pc_group in pc_groups:
+        m, d = get_mechanisms_for_pc_group(pc_group)
+        for tag in m:
+            if tag not in mechanisms:
+                mechanisms.append(tag)
+        for dis in d:
+            if dis not in diseases:
+                diseases.append(dis)
+    return mechanisms, diseases
