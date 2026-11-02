@@ -2,8 +2,8 @@
 Cleans GenAge's model-organism gene list (datas/genage_models.csv) into
 biology-evidence chunks. Every row here is an animal gene (yeast/worm/fly/
 mouse/etc.) with no human relevance on its own — so each row is bridged to
-its human ortholog using the real Alliance + FlyBase ortholog data (Saulo's
-resources, see ortholog_lookup.py) before it becomes a chunk.
+its human ortholog using the real Alliance + FlyBase ortholog data (see
+ortholog_lookup.py) before it becomes a chunk.
 
 Rows whose gene has no human ortholog match in either resource are dropped —
 there's nothing to ground them in human biology, so they're not useful here
