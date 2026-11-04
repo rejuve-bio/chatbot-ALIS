@@ -1,0 +1,25 @@
+{
+  "demo_only": true,
+  "patient_id": "synthetic-feedback-flow-demo",
+  "risk_areas": [
+    {
+      "disease_name": "Prediabetes remission",
+      "investigational_evidence": [
+        {
+          "name": "Metformin",
+          "drugs": [
+            "Metformin"
+          ],
+          "why": "Research claim: adding metformin to lifestyle intervention improves prediabetes remission versus lifestyle alone in the study population.",
+          "publications": [
+            {
+              "pmid": "42655937",
+              "title": "Impact of Metformin Plus Lifestyle Intervention Compared With Lifestyle Intervention Alone on Prediabetes Remission in Participants With Impaired Glucose Regulation: The China DPP Study.",
+              "url": "https://pubmed.ncbi.nlm.nih.gov/42655937/"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

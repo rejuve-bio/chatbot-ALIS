@@ -1,0 +1,5 @@
+!(import_prolog_functions_from_file (library Omega ./src/skills.pl) (first_char gc))
+(= (getSkills) ("read-current-feedback" "apply-review-policy" "finish-reviewed-atlas"))
+(= (read-current-feedback) (py-call (bridge.read_feedback)))
+(= (apply-review-policy) (py-call (bridge.apply_policy)))
+(= (finish-reviewed-atlas) (py-call (bridge.finish)))

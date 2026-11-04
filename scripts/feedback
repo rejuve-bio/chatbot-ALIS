@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""Clinician judgments, shared review notes and native PLN appraisal ranking."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import shlex
+import sqlite3
+import sys
+import textwrap
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from app.services.feedback_pln import NativePLNError
+from app.services.feedback_beliefs import ADAPTER as BELIEF_ADAPTER, SEMANTICS as BELIEF_SEMANTICS
+from app.services.feedback_source_scores import SEMANTICS, score_sources
+from app.services.feedback_store import FeedbackStore, candidates_from_json
+from app.services.feedback_auth import AuthenticationError, LoginSession, configured_api, interactive_login
+from app.services.feedback_backend import ensure_alis_ready
+from app.services.feedback_omega import OmegaReviewClient, OmegaReviewError, packet as review_packet
+from app.services.feedback_reason_schema import validate_review_reason
+from app.services.feedback_source_display import source_sections
+from app.services.feedback_menu import GuidedFeedback
+
+HELP = """Commands
+  list [condition]                  Show score order with stable entry IDs for review N
+  show N                           Read the intervention and current review claim
+  claim N                          Propose precise claim wording with a linked source quote
+  claims N                         Inspect claim proposals, sources and approval status
+  details N                        Read full supplied rationale, safety text and gene annotations
+  assess N [--retry]               Inspect source facts; --retry explicitly resubmits a failed request
+  evidence N                       See reported effect inputs, exclusions and source confirmation
+  source-text N PMID:ID             Read the saved abstract for a factual correction
+  correct-source N                  Correct a quoted source fact; preview and confirm recalculation
+  restore-evidence N EVENT "reason" Restore an earlier source snapshot with an audit record
+  review N                         See current score and clinician responses, then give your review
+  login / logout                   Authenticate a different clinician / end this login
+  signup                           Create another clinician through the existing signup flow
+  whoami                           Show the signed-in clinician's account ID
+  reviews N                        See other reviewers' current responses
+  reason N                         Inspect previously saved Omega interpretations
+  rank [condition]                 Rank by clinician appraisal strength; confidence shown separately
+  history N                        See previous judgments and score versions
+  trace N                          Inspect the saved native PLN calculation
+  withdraw N                       Withdraw your current judgment
+  correct N                        Propose a correction to the supplied assessment
+  teach N                          Propose a source-cited evidence correction for reuse
+  learning N                       See learned knowledge, approvals and where it was applied
+  unlearn ID "reason"              Approver retires a learned correction; keep its audit history
+  corrections                      List pending corrections
+  accept ID / reject ID            Resolve another reviewer's correction
+  import "FILE.json"               Open a supplied handoff for this clinician; preserve review history
+  export "NEW-FILE.json"            Export evidence, reviews and native traces
+  explain                          Explain the numbers
+  help / quit
+
+Short form: review N support|oppose|uncertain ["note"] ["citation"]
+Review notes are shared with other clinicians. They are not interpreted or scored.
+Correction: correct N FIELD "replacement" "reason" ["citation"]
+Reusable:   teach N why|note "replacement" "reason" "public citation"
+Claim:      claim N "statement" "PMID:ID" "supporting quote" ["reason"]
+"""
+
+ASPECT_LABELS = {"evidence_sufficiency":"Evidence is sufficient", "human_applicability":"Human applicability",
+                "benefit_claim":"Reported benefit is supported", "safety":"Safety assertion is supported",
+                "patient_suitability":"Suitability according to clinician"}
+
+
+def clean(value) -> str:
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value))
+
+
+def say(value="", indent=0):
+    text = clean(value)
+    print(textwrap.fill(text, width=96, initial_indent=" " * indent,
+                        subsequent_indent=" " * indent) if text else "")
+
+
+def short(value, maximum=140):
+    text = clean(value)
+    return text if len(text) <= maximum else text[:maximum-1] + "…"
+
+
+def print_source_findings(source):
+    for section in source_sections(source):
+        say(source['id']+' — '+section['label']+':',2)
+        say(section['quote'],4)
+        if section['truncated']:
+            say('Excerpt shortened for display; the saved source text contains more.',4)
+
+
+def score_text(assessment) -> str:
+    if not assessment:
+        return "not assessed — use assess N"
+    if assessment.get('adapter') == BELIEF_ADAPTER or str(assessment.get('adapter','')).startswith('reason-grounded-appraisal-v'):
+        if assessment['strength'] is None:
+            return 'unreviewed' if assessment['status']=='unreviewed' else 'review saved; source reference needed for numerical appraisal' if assessment['status']=='needs_reference' else 'uncertain — no decisive appraisal'
+        flag=' · DISAGREEMENT' if assessment['conflict'] else ''
+        label='review-count confidence' if assessment.get('adapter') == BELIEF_ADAPTER else 'reference-group confidence (previous policy)'
+        return f"{100*assessment['strength']:.1f}/100 clinician support | {label} {assessment['confidence']:.3f}"+flag
+    if "score_100" not in assessment:
+        return "legacy review agreement (history only)"
+    if assessment["score_100"] is None:
+        return "unscored — " + assessment.get("reason", "source inputs need review")
+    return f"source statistical strength {assessment['strength']:.3f} | information confidence {assessment['confidence']:.3f}"
+
+
+def print_assessment(assessment):
+    if assessment and (assessment.get('adapter') == BELIEF_ADAPTER or str(assessment.get('adapter','')).startswith('reason-grounded-appraisal-v')):
+        say('PLN research-claim appraisal: '+score_text(assessment))
+        say(f"Current judgments: {assessment['support']} support, {assessment['oppose']} oppose, {assessment['uncertain']} uncertain.")
+        if assessment.get('adapter') == BELIEF_ADAPTER:
+            n=assessment['decisive_count']
+            if n:
+                say(f"Review-count confidence: {n}/({n}+1), from {n} decisive reviewer(s). Each clinician counts once; an uncertain judgment adds no decisive weight.")
+            else:
+                say('No decisive reviews yet; strength and review-count confidence remain unknown.')
+            say('This counts review volume. It does not assess scientific certainty or establish that reviewers are independent.')
+        else:
+            say(f"Previous policy: {assessment['ground_count']} decisive reference group(s); confidence counted references rather than reviewers.")
+        if assessment['conflict']:
+            say('Reviewers disagree. Inspect their selected judgments and shared notes with reviews N.')
+        for aspect, value in assessment.get('aspect_assessments',{}).items():
+            pair='unknown' if value['strength'] is None else f"strength {value['strength']:.3f}, confidence {value['confidence']:.3f}"
+            say(ASPECT_LABELS[aspect]+': '+pair,2)
+        return
+    say("Source-reported statistics: " + score_text(assessment))
+    if not assessment or "score_100" not in assessment:return
+    if assessment["score_100"] is not None:
+        say(f"Native PLN strength: {assessment['strength']:.6f} | statistical-information confidence: {assessment['confidence']:.6f}")
+        say(f"{assessment['numerical_input_count']} source-effect input(s). Reviewer counts add no evidence weight.")
+        say("Experimental source-statistics adapter; displayed separately from clinician appraisal and not used for ranking.")
+        if assessment.get('conflicting_directions'):say('Independent study estimates point in opposing directions. The combined index does not resolve that conflict; inspect the sources.')
+    for item in assessment.get('unscored',[]):
+        say(item['source_id']+": "+" ".join(item['reasons']),2)
+
+
+class Session:
+    def __init__(self, store: FeedbackStore, authentication: LoginSession, provider: str, api_url: str,
+                 auto_start=True, access_mode="file", omega=None):
+        self.store = store
+        self.authentication = authentication
+        self.provider = provider
+        self.api_url = api_url
+        self.auto_start = auto_start
+        self.access_mode = access_mode
+        self.omega = omega
+
+    @property
+    def reviewer(self):
+        if self.authentication is None:
+            raise AuthenticationError("You are logged out. Use login before accessing or submitting reviews.")
+        return self.authentication.clinician
+
+    def require_access(self, patient_id=None):
+        if self.authentication is None:
+            raise AuthenticationError("You are logged out. Use login before accessing or submitting reviews.")
+        self.store.reconnect()
+        if self.access_mode == "file":
+            self.authentication.require()
+            self.store.require_file_review(self.reviewer, patient_id)
+            return
+        if patient_id is None:
+            records = self.store.candidates()
+            patient_id = records[0]["patient_id"]
+        self.authentication.require(patient_id)
+
+    def import_handoff(self, path: Path):
+        if self.authentication is None:
+            raise AuthenticationError("Log in before opening a review file.")
+        self.store.reconnect()
+        self.authentication.require()
+        path = path.expanduser().resolve()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        candidates_from_json(data)
+        if self.access_mode == "patient":
+            self.authentication.require(data["patient_id"])
+        self.store.reconnect()
+        return self.store.import_data(data, path.name,
+                                      file_reviewer=self.reviewer if self.access_mode == "file" else None)
+
+    def whoami(self):
+        clinician = self.reviewer
+        say("Signed in: " + clinician.name + " <" + clinician.email + ">")
+        say("Clinician account ID: " + clinician.id)
+        say("Account provider: " + clinician.provider)
+        if clinician.provider == "alis":
+            say("ALIS clinician ID: " + clinician.subject + " | Clinic ID: " + str(clinician.clinic_id))
+        else:
+            say("Local test account; this does not verify professional clinician credentials.")
+
+    def listing(self, condition=""):
+        say("Interventions in revised score order within each condition. Entry IDs stay fixed for review N.")
+        for group in self.store.rankings(condition):
+            print()
+            say(group["condition"])
+            rows=[(row["candidate"],row["assessment"],"Rank "+str(row["rank"])) for row in group["ranked"]]
+            rows.extend((candidate,self.store.belief_assessment(candidate),"Unranked") for candidate in group["unranked"])
+            for candidate,assessment,label in rows:
+                learned = " · learned " + ", ".join("#" + str(k["id"]) for k in candidate["learned_knowledge"]) if candidate["learned_knowledge"] else ""
+                say(f"{label} | entry {candidate['position']}: {candidate['name']} — {score_text(assessment)}{learned}", 2)
+                if candidate['data'].get('review_claim'):say('Claim: '+short(candidate['proposition'],240),4)
+        print()
+        say("Use the entry ID with review N or show N. For example, review 2 opens entry 2 even if its rank changes.")
+
+    def login_list(self):
+        """Redisplay the opened handoff only after this account's access check."""
+        self.store.reconnect()
+        if not self.store.db.execute("SELECT 1 FROM settings WHERE key='dataset'").fetchone():
+            say('Open a handoff with import "FILE.json" to see its ranked intervention list.')
+            return
+        try:
+            self.require_access()
+        except AuthenticationError:
+            say('Signed in. Open an authorized handoff with import "FILE.json" to see its ranked intervention list.')
+            return
+        self.listing()
+
+    def show(self, candidate):
+        data = candidate["data"]
+        print()
+        say(candidate["name"] + " | " + candidate["condition"])
+        say("Record: " + candidate["id"][:12] + " | Evidence version: " + candidate["current_version"][:12])
+        say("Section: " + candidate["category"].replace("_", " "))
+        drugs = data.get("drugs") or []
+        if drugs:
+            say("Listed drugs: " + ", ".join(map(str, drugs)))
+            if len(drugs) > 1:
+                say("This is a group-level entry. Your judgment applies to the displayed group, not a separately assessed individual drug.")
+        say("Review statement: " + candidate["proposition"])
+        say("Upstream evidence label: " + str(data.get("evidence", data.get("evidence_tier", "not supplied"))))
+        sources = data.get("sources") or ([data["source"]] if data.get("source") else [])
+        if sources:
+            say("Source collections: " + ", ".join(map(str, sources)))
+        rationale = data.get("why") or data.get("note")
+        if rationale:
+            say("Supplied rationale: " + short(rationale, 1000))
+        warning = data.get("warning") or data.get("safety_warning")
+        if warning:
+            say("Supplied warning (requires review): " + short(warning, 600))
+        if data.get("interactions") or data.get("interactions_and_contraindications"):
+            say("Additional supplied interaction/safety text is available with details N.")
+        publications = data.get("publications") or []
+        pmids = data.get("pmids") or []
+        say("Sources supplied with this entry:")
+        for publication in publications:
+            say(f"PMID:{publication.get('pmid', '?')} — {publication.get('title', '')}", 2)
+            say(publication.get("url", ""), 4)
+        if pmids:
+            say("PubMed IDs: " + ", ".join(map(str, pmids)), 2)
+        for url in (data.get("url"), data.get("evipedia_url")):
+            if url:
+                say(url, 2)
+        if not publications and not pmids:
+            say("No paper references were supplied for this entry.", 2)
+        trials = data.get("active_trials") or []
+        for trial in trials:
+            say(f"Trial {trial.get('nct_id', '?')}: {trial.get('title', '')} ({trial.get('status', '')})", 2)
+        if trials:
+            say("These trial listings do not contain results in this handoff.", 2)
+        if candidate["origin"] != "upstream":
+            say("Local assessment includes " + candidate["origin"] + "; original JSON is preserved.")
+        self.learned_summary(candidate)
+        self.claim_grounding(candidate)
+        pending=[r for r in self.store.claim_proposals(candidate) if r['status']=='pending' and r['base_version']==candidate['current_version']]
+        if pending:say(f"{len(pending)} claim clarification(s) await another clinician. Use claims N.")
+        print()
+        self.review_status(candidate)
+        history = self.store.history(candidate)
+        old = [r for r in history["reviews"] if r["version_id"] != candidate["current_version"]]
+        if old:
+            say(f"{len(old)} historical review event(s) concern earlier claim wording/evidence; they are not counted here.")
+        say("Next: review N | claim N | claims N | history N | learning N")
+
+    def details(self, candidate):
+        self.show(candidate)
+        data = candidate["data"]
+        for field in ("why", "note", "warning", "safety_warning", "interactions", "interactions_and_contraindications"):
+            if data.get(field):
+                print()
+                say("Full supplied " + field.replace("_", " ") + " (upstream text, requires review):")
+                for paragraph in str(data[field]).splitlines():
+                    say(paragraph, 2)
+        genes = data.get("gene_level_grounding") or []
+        if genes:
+            print()
+            say("Supplied gene annotations (not automatically intervention-effect evidence):")
+            for gene in genes:
+                say(gene.get("gene", "Unnamed gene"), 2)
+                for field in ("human_aging_link", "model_organism_link", "senescence_effect", "senescence_expression", "targeted_by_drug"):
+                    annotation = gene.get(field)
+                    if isinstance(annotation, dict):
+                        items = []
+                        for key, value in annotation.items():
+                            if value is not None:
+                                display = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+                                items.append(key.replace("_", " ") + ": " + display)
+                        say(field.replace("_", " ") + " — " + "; ".join(items), 4)
+
+    def reviews(self, candidate, compact=False):
+        rows = self.store.current_reviews(candidate)
+        if not rows:
+            say("No current reviews for this evidence version.")
+            return
+        for row in rows:
+            yours = " (your current response)" if row["clinician_id"] == self.reviewer.id else ""
+            say(f"#{row['id']} {row['reviewer']}{yours} — {row['decision']} | {row['created_at']}")
+            if not compact:
+                say(f"Clinician ID: {row['clinician_id']} | {row['clinician_email']} | {row['identity_provider']}", 2)
+            say(('Note: '+row['rationale']) if row['rationale'] else 'No note supplied.', 2)
+            if row["citation"]:
+                say("Reference: " + row["citation"], 2)
+            if row.get("reason_analysis"):
+                state="confirmed" if row["analysis_confirmed"] else "not applied; original judgment retained"
+                say("Previous Omega interpretation ("+state+"): "+row["reason_analysis"]["analysis"]["summary"], 2)
+                if row.get("decision_override"):
+                    say("Clinician explicitly set the final judgment to "+row["decision"]+"; Omega proposed "+row["reason_analysis"]["analysis"]["proposed_decision"]+".",2)
+
+    def ranking(self, condition="", compact=False):
+        groups=self.store.rankings(condition)
+        say("Research-candidate ranking — clinician appraisal, grouped by condition.")
+        say("Order: PLN strength, then review-count confidence; equal pairs share a rank. This ranks appraisal of the supplied evidence, not treatment benefit.")
+        for group in groups:
+            print();say(group['condition'])
+            if not group['ranked']:say("No decisive appraisals yet. Use review N.",2)
+            rows=group['ranked'][:5] if compact else group['ranked']
+            for row in rows:
+                a,c=row['assessment'],row['candidate']
+                say(f"Rank {row['rank']} | entry {c['position']}: {c['name']} — {score_text(a)}",2)
+                say(f"{a['support']} support, {a['oppose']} oppose, {a['uncertain']} uncertain; each clinician has one current judgment",4)
+                if c["data"].get("review_claim"):say("Claim: "+c["proposition"],4)
+            if group['unranked']:say(f"{len(group['unranked'])} entries have no supported score and remain unranked.",2)
+
+    def source_preview(self, candidate, result, full=False, display_stat=True):
+        records=self.store.source_plan(candidate,result)
+        old={r['source']['id']:r['facts'] for r in self.store.source_records(candidate)}
+        say("Source facts proposed for confirmation:")
+        for r in records:
+            f=r['facts'];e=f['effect'];previous=old.get(f['source_id'])
+            label='new' if previous is None else ('unchanged' if previous==f else 'revised')
+            say(f['source_id']+' ['+label+'] — '+f['population_type']+'; '+f['design']+'; '+f['comparison']+'; condition '+f['condition_match'],2)
+            say(f['population']+' | '+f['outcome']+' | comparator: '+f['comparator'],4)
+            if previous and previous.get('effect')!=e:
+                say('Previous numerical input: '+json.dumps(previous.get('effect'),ensure_ascii=False),4)
+            if e:
+                say(f"{e['measure']} {e['estimate']} ({e['ci_level']}% CI {e['ci_lower']} to {e['ci_upper']}); improvement direction: {e['direction']}",4)
+                say('Source quote: '+e['quote'],4)
+            else:say('No supported effect/CI tuple extracted.',4)
+            if full:
+                for quote in f['source_quotes']:say('Context quote: '+quote,4)
+            print_source_findings(r['source'])
+        if display_stat:
+            proposed=score_sources(records)
+            print_assessment(proposed)
+        say("Confirming records the interpretation and source facts. Your judgment updates the appraisal; it does not create another study.")
+
+    def analyze_sources(self, candidate, retry=False):
+        if self.omega is None:raise ValueError('Source assessment requires native Omega. Manual judgments remain separate from evidence calculations.')
+        stored=self.obtain_analysis(candidate,'uncertain','Initial source assessment: inspect the primary comparative human results for the stated condition; retain missing information explicitly.','',retry=retry)
+        head=self.store.evidence_digest(self.store.source_records(candidate))
+        self.source_preview(candidate,stored['result'],full=True)
+        if input('Confirm these source facts and calculate/store the evidence score? [y/N]: ').strip().casefold()!='y':
+            say('Source proposal saved for inspection; evidence score unchanged.');return
+        update=self.store.confirm_source_analysis(candidate,self.reviewer,stored['id'],expected_digest=head)
+        say('Before: '+score_text(update['before']));say('After: '+score_text(update['after']))
+        if not update['changed']:say('Identical source facts already saved. No extra evidence weight was added.')
+        self.ranking(candidate['condition'],compact=True)
+
+    def evidence(self,candidate):
+        print_assessment(self.store.latest_evidence_score(candidate))
+        for r in self.store.source_records(candidate):
+            f=r['facts'];say(f['source_id']+' — '+f['outcome'])
+            say('Population: '+f['population']+' | comparator: '+f['comparator'],2)
+            if f['effect']:say('Reported input: '+json.dumps(f['effect'],ensure_ascii=False),2)
+            for quote in f['source_quotes']:say('Context quote: '+quote,2)
+            print_source_findings(r['source'])
+        events=[e for e in self.store.evidence_events(candidate) if e['version_id']==candidate['current_version']]
+        if events:
+            e=events[-1];say(f"Source event #{e['id']} confirmed by {e['reviewer']} at {e['created_at']}. All reviewers of this entry see these same source facts.")
+
+    def interpretation(self, stored, compact=False):
+        result=stored["result"]
+        analysis=result["analysis"]
+        say("Omega interpretation: "+analysis["summary"])
+        say("Proposed research-retention judgment: "+analysis["proposed_decision"])
+        for item in analysis["assessments"]:
+            if not compact:
+                say(ASPECT_LABELS[item["aspect"]]+" — "+item["decision"]+": "+item["explanation"], 2)
+                for check in item["source_checks"]:
+                    say("Inspected quote ("+check["source_id"]+"): "+check["quote"], 4)
+        limits=analysis["limitations"][:2] if compact else analysis["limitations"]
+        for limitation in limits:
+            say("Uncertainty: "+limitation, 2)
+        for change in result.get("policy_adjustments",[]):
+            if change.get('aspect'):
+                say("Reason rule: an evidence gap leaves "+ASPECT_LABELS[change["aspect"]].lower()+" unresolved; no effect/safety premise is invented.", 2)
+            else:say('Source rule: '+change['rule'],2)
+        usage=result["usage"]
+        say("Native Omega "+result["runtime"]["core_commit"][:12]+" | "+result["runtime"]["model"]+" | "+("saved interpretation; no new model call" if stored.get("cached") else "one bounded model call"))
+        if not compact:
+            say("Tools: "+" → ".join(t["tool"] for t in result["tool_trace"]))
+            say(f"Recorded usage: {usage.get('prompt_tokens')} input tokens; {usage.get('completion_tokens')} output tokens.")
+
+    def reason(self, candidate):
+        found=False
+        for review in self.store.current_reviews(candidate):
+            if not review.get("reason_analysis"):
+                continue
+            found=True
+            say("Review #"+str(review["id"])+" by "+review["reviewer"])
+            say("Submitted judgment: "+str(review["submitted_decision"])+" | Recorded judgment: "+review["decision"])
+            if review.get("decision_override"):
+                say("The clinician explicitly chose the final judgment after inspecting Omega's interpretation.")
+            say("Interpretation "+("confirmed; source facts eligible for evidence recalculation" if review["analysis_confirmed"] else "declined; not used as claim-specific PLN input"))
+            self.interpretation({"result":review["reason_analysis"],"cached":True})
+        if not found:
+            say("No Omega interpretation is attached to current reviews. Existing manual reviews remain visible with reviews N.")
+
+    def obtain_analysis(self, candidate, decision, rationale, citation, retry=False):
+        validate_review_reason(rationale)
+        identity=self.omega.identity()
+        request=review_packet(candidate,decision,rationale,citation,clinician=self.reviewer)
+        key=self.omega.cache_key(request)
+        stored=self.store.cached_analysis(key)
+        if stored is None:
+            rejected=self.store.cached_analysis('rejected:'+key)
+            if rejected and not retry:
+                raise OmegaReviewError('This exact request was already rejected: '+rejected['result']['error']+
+                    ' Edit the saved draft with review N, or explicitly resubmit with review N --retry (assess N --retry for assessments). No new model call was made.')
+            if not self.store.has_external_consent(self.reviewer,identity):
+                say("Omega uses the configured external model "+identity["model"]+" at "+identity["destination"]+".")
+                say("It receives the intervention, condition, selected evidence text/publication references and your review reason. Patient-ID fields, clinician account details and login credentials are excluded; known identifiers/emails in text are redacted.")
+                if input("Allow this authorized handoff's review text to be sent to that service? [y/N]: ").strip().casefold()!="y":
+                    raise OmegaReviewError("No review text was sent. Draft retained. Use --omega off for a manual review, or return later to authorize Omega.")
+                self.store.record_external_consent(self.reviewer,identity)
+            say("Omega is interpreting the reason and checking available source excerpts…")
+            try:
+                result=self.omega.analyze(request,progress=say)
+            except OmegaReviewError as error:
+                self.store.save_analysis('rejected:'+key,{'status':'rejected','error':str(error),'diagnostic':error.diagnostic})
+                raise OmegaReviewError(str(error)+' Draft retained. This failed request will not be sent again automatically; review N lets you edit it.') from None
+            stored=self.store.save_analysis(key,result)
+        return stored
+
+    def interpret_review(self, candidate, decision, rationale, citation, retry=False):
+        stored=self.obtain_analysis(candidate,decision,rationale,citation,retry=retry)
+        self.interpretation(stored,compact=True)
+        if stored["result"]["analysis"]["proposed_decision"]!=decision:
+            say("Your submitted judgment was "+decision+". Omega proposes a different judgment; it will only be applied if you confirm it.")
+        self._review_source_digest=self.store.evidence_digest(self.store.source_records(candidate))
+        self.source_preview(candidate,stored["result"],display_stat=False)
+        choice=input("1 Confirm interpretation | 2 Keep original judgment only | 3 Set intended judgment | 4 Cancel: ").strip()
+        if choice=="1":
+            return stored["result"]["analysis"]["proposed_decision"],stored["id"],True,False
+        if choice=="2":
+            return decision,stored["id"],False,False
+        if choice=="3":
+            judgment=input("Your intended judgment: 1 Support | 2 Oppose | 3 Uncertain: ").strip().casefold()
+            judgment={"1":"support","2":"oppose","3":"uncertain"}.get(judgment,judgment)
+            if judgment not in ("support","oppose","uncertain"):
+                raise OmegaReviewError("Choose support, oppose or uncertain. The draft is retained.",cancelled=True)
+            return judgment,stored["id"],True,True
+        raise OmegaReviewError("Review not submitted. Your draft and any completed interpretation are saved; use review N to resume.",cancelled=True)
+
+    def review_status(self, candidate):
+        print_assessment(self.store.belief_assessment(candidate))
+        for record in self.store.source_records(candidate):
+            f=record['facts']
+            say(f['source_id']+' study context: '+f['population']+' | comparison: '+f['comparator'],2)
+            print_source_findings(record['source'])
+        say("Clinician responses for this evidence version:")
+        self.reviews(candidate, compact=True)
+
+    def claim_source_context(self,source):
+        title=source.get('title') or source.get('text','').split('\n')[0]
+        if title:say('Linked paper: '+short(title,350),2)
+        match=re.search(r'\bMethods\s*:\s*(.*?)(?=\bResults\s*:|\bConclusions?\s*:|$)',source.get('text',''),re.I|re.S)
+        if match:
+            say('Study methods — excerpt from the saved abstract:',2)
+            say(short(match.group(1).strip(),1800),4)
+
+    def claim_grounding(self,candidate):
+        if not candidate.get('claim_approved'):
+            if candidate['data'].get('review_claim'):
+                say('Claim wording was supplied upstream; no shared approval is recorded here.')
+            else:
+                say('This is the broad upstream review statement. Use claim N to propose a statement tied to a specific study.')
+            return
+        grounding=candidate['data'].get('review_claim_grounding') or {}
+        say('Claim wording approved for reuse; research support is assessed separately below.')
+        say('Supporting source: '+grounding.get('source_id','')+' — '+grounding.get('url',''),2)
+        say('Supporting quote: '+grounding.get('quote',''),2)
+        say('Quote checked against the saved abstract. The approval records a clinician check of the claim scope.',2)
+
+    def claim_proposal(self,row):
+        state=row['status']
+        say(f"Claim proposal #{row['id']} — {state}; proposed by {row['proposer']}")
+        say('Statement: '+row['replacement'],2)
+        say('Reason: '+row['rationale'],2)
+        grounding=json.loads(row.get('grounding_json') or '{}')
+        if grounding:
+            say('Source: '+grounding['source_id']+' — '+grounding['url'],2)
+            say('Supporting quote: '+grounding['quote'],2)
+            say('Saved abstract SHA-256: '+grounding['source_text_sha256'],2)
+        if row.get('resolver'):say('Decision by '+row['resolver']+': '+row['resolution_reason'],2)
+
+    def claims(self,candidate):
+        say('Current review statement: '+candidate['proposition'])
+        self.claim_grounding(candidate)
+        rows=self.store.claim_proposals(candidate)
+        if not rows:say('No claim wording proposals yet. Use claim N.');return
+        for row in rows:
+            self.claim_proposal(row)
+            if row['status']=='pending' and row['base_version']!=candidate['current_version']:
+                say('This proposal targets earlier wording/evidence and cannot be approved.',2)
+        say('A different clinician can accept or reject a pending proposal. Approval creates new claim wording; it does not submit a Support judgment.')
+
+    def propose_claim(self,candidate,args):
+        if args and len(args) not in (3,4):
+            raise ValueError('Use claim N "statement" "PMID:ID" "exact supporting quote" ["reason"], or claim N for guided entry.')
+        ids=self.store.claim_source_ids(candidate)
+        if not ids:raise ValueError('The supplied entry needs a linked PMID before a source-quoted claim can be proposed.')
+        say('Clarify the shared research claim using its linked paper. Keep patient-specific observations in the local review.')
+        source_id=args[1] if args else ids[0] if len(ids)==1 else input('Choose a linked source ('+', '.join(ids)+'): ').strip()
+        say('Reading the linked abstract. This may retrieve public paper text; no model call or patient data is sent.')
+        source,origin=self.store.claim_source(candidate,source_id)
+        say(source['id']+' — '+origin+' — '+source['url'])
+        self.claim_source_context(source)
+        print_source_findings(source)
+        say('Current statement: '+candidate['proposition'])
+        statement=args[0] if args else input('Precise research claim (include the studied population/outcome): ').strip()
+        quote=args[2] if args else input('Paste an exact supporting passage from the abstract: ').strip()
+        reason=args[3] if len(args)==4 else 'Clarify the review statement to match the published study.'
+        identity=self.store.propose_claim(candidate,self.reviewer,statement,source['id'],quote,reason)
+        say(f'Claim proposal #{identity} saved. The current statement and score are unchanged.')
+        say(f'Another clinician can inspect claims {candidate["position"]}, then accept {identity} or reject {identity}.')
+
+    def learned_summary(self, candidate):
+        for fact in candidate["learned_knowledge"]:
+            label={'review_claim':'review statement','why':'evidence rationale','note':'evidence note'}.get(fact['field'],fact['field'])
+            say(f"Approved {label} #{fact['id']}; proposed by {fact['proposer']}, approved by {fact['approver']}.")
+            say("Source: " + fact["citation"] + ". Use learning N for the reuse trace.", 2)
+
+    def learning(self, candidate):
+        say("Learning trace — " + candidate["name"] + " | " + candidate["condition"])
+        belief = self.store.belief_assessment(candidate)
+        print_assessment(belief)
+        events = self.store.belief_history(candidate)
+        for event in events[-5:]:
+            say(f"Belief #{event['assessment_id']}: {score_text(event)} — {event['trigger']}",2)
+        say('Appraisal history: judgments and references are retained; replacements and withdrawals do not accumulate old weight. New review notes are for other clinicians to read.')
+        say('Knowledge learning: approved source corrections can be reused when the same claim and source snapshot recur.')
+        facts = self.store.learning_details(candidate)
+        if not facts:
+            say("No reusable correction has been approved for this claim. Use claim N to clarify its wording, or teach N for a rationale correction; another clinician must approve it.")
+            return
+        original = self.store._source_data(candidate)
+        for fact in facts:
+            say(f"Knowledge #{fact['id']} — {fact['status']}")
+            if fact["applied"]:
+                say("Applied automatically: intervention, condition and supplied evidence snapshot match.", 2)
+            elif not fact["source_matches"]:
+                say("Not applied: the supplied evidence has changed. This correction needs a new review against those sources.", 2)
+            elif fact["status"] != "active":
+                say("Not reused: this knowledge was " + fact["status"] + ".", 2)
+            else:
+                say("Not applied: an explicit local correction is preserved for this record.", 2)
+            label={'review_claim':'review statement','why':'evidence rationale','note':'evidence note'}.get(fact['field'],fact['field'])
+            original_value=original.get(fact['field']) or ('The supplied evidence supports retaining '+candidate['name']+' as a research candidate for '+candidate['condition']+'.' if fact['field']=='review_claim' else 'not supplied')
+            say('Original supplied '+label+': '+str(original_value),2)
+            say("Learned replacement: " + fact["replacement"], 2)
+            if fact.get("grounding_json"):
+                g=json.loads(fact["grounding_json"]);say("Supporting quote: "+g["quote"],2)
+            say("Reason: " + fact["rationale"], 2)
+            say("Source reference: " + fact["citation"], 2)
+            say("Proposed by " + fact["proposer"] + "; approved by " + fact["approver"] + " at " + fact["created_at"], 2)
+            say("Approval reason: " + fact["approval_reason"], 2)
+            for event in fact["events"]:
+                if event["action"] != "approved":
+                    say(event["action"] + ": " + event["reason"] + " | " + event["created_at"], 2)
+        say("Knowledge reuse updates the assessment text. This record keeps its own clinician judgments and score.")
+
+    def review(self, candidate, parts):
+        if parts == ['--retry']:
+            raise ValueError('Reviews no longer call Omega. Use review N to submit your judgment and optional note.')
+        if len(parts) > 3:
+            raise ValueError('Use review N support|oppose|uncertain ["note"] ["citation"].')
+        print()
+        say("Reviewing: " + candidate["name"] + " | " + candidate["condition"])
+        say("Review statement: " + candidate["proposition"])
+        self.learned_summary(candidate)
+        self.claim_grounding(candidate)
+        self.review_status(candidate)
+        if any(row["clinician_id"] == self.reviewer.id for row in self.store.current_reviews(candidate)):
+            say("Your new response will replace your current response; it will not count as an additional reviewer.")
+        say("Your selected judgment updates the appraisal. Notes are shared with other clinicians; no model call is made.")
+        print()
+        draft=self.store.review_draft(candidate,self.reviewer) if not parts else None
+        if draft:
+            say('Saved draft: '+draft['decision']+' — '+draft['rationale'])
+            if draft['rationale'].strip() in ('1','2','3','support','oppose','uncertain'):
+                say('This older draft has a judgment in its reason field. Edit it below; no model call has been made.')
+                draft=None
+            else:
+                choice=input('Saved draft: 1 Resume | 2 Edit | 3 Discard | 4 Cancel [1]: ').strip() or '1'
+                if choice=='2':draft=None
+                elif choice=='3':
+                    self.store.discard_draft(candidate,self.reviewer)
+                    say('Draft discarded. Saved reviews and scores are unchanged.');return
+                elif choice!='1':
+                    say('Draft retained. No model call was made.');return
+        if draft:
+            decision=draft["decision"]
+            rationale=draft["rationale"]
+            citation=draft["citation"]
+            say("Resuming saved review draft: "+decision+" — "+rationale)
+        elif parts:
+            decision = parts[0].casefold()
+        else:
+            say("Does the supplied evidence support the review statement shown above?")
+            decision = input("1 Support | 2 Oppose | 3 Uncertain: ").strip().casefold()
+        decision = {"1": "support", "2": "oppose", "3": "uncertain"}.get(decision, decision)
+        if decision not in ("support", "oppose", "uncertain"):
+            raise ValueError("Choose support, oppose or uncertain.")
+        if not draft:
+            rationale = parts[1] if len(parts) > 1 else ("" if parts else input("Reason for other reviewers (optional): ").strip())
+            citation = parts[2] if len(parts) > 2 else ("" if parts else input("Source/reference (optional, shared with your review): ").strip())
+        rationale,citation=rationale.strip(),citation.strip()
+        self.store.save_draft(candidate,self.reviewer,decision,rationale,citation,notes_only=True)
+        say("Saving your judgment and recalculating the clinician appraisal through native PLN…")
+        update = self.store.review(candidate["id"], candidate["current_version"], self.reviewer, decision, rationale, citation,
+                                  submitted_decision=decision,notes_only=True)
+        update = dict(update, before=update['belief_before'], after=update['belief_after'])
+        if not update["changed"]:
+            say("Identical response already saved. Nothing was counted twice.")
+        else:
+            say("Before: " + score_text(update["before"]))
+            say("After:  " + score_text(update["after"]))
+        print_assessment(update["after"])
+        say("Notes and citations are shared context; neither changes appraisal weights or source facts.")
+        say("Saved. Other clinicians opening this entry in this database see your judgment, note, appraisal and review history.")
+        self.ranking(candidate["condition"],compact=True)
+
+    def command(self, line: str) -> bool:
+        parts = shlex.split(line)
+        if not parts:
+            return True
+        command, args = parts[0].casefold(), parts[1:]
+        if command in ("quit", "exit"):
+            return False
+        if command in ("signup", "register"):
+            if args:
+                raise ValueError("Use signup without arguments; credentials are entered privately.")
+            if self.provider == "alis":
+                ensure_alis_ready(self.api_url, self.auto_start)
+            self.authentication = None
+            self.authentication = interactive_login(self.store, self.provider, self.api_url, create_account=True)
+            self.whoami()
+            self.login_list()
+            return True
+        if command == "login":
+            if self.provider == "alis":
+                ensure_alis_ready(self.api_url, self.auto_start)
+            self.authentication = None
+            authentication = interactive_login(self.store, self.provider, self.api_url)
+            self.authentication = authentication
+            self.whoami()
+            self.login_list()
+            return True
+        if command == "logout":
+            self.authentication = None
+            say("Logged out. Saved reviews remain associated with their clinician accounts. Use login to continue.")
+            return True
+        if command == "whoami":
+            self.whoami()
+            return True
+        if command == "reviewer":
+            raise AuthenticationError("Reviewer names cannot be switched. Use login to authenticate a different clinician account.")
+        if command not in ("help", "explain", "import"):
+            self.require_access()
+        if command == "help":
+            print(HELP)
+        elif command == "list":
+            self.listing(" ".join(args))
+        elif command == "rank":
+            self.ranking(" ".join(args))
+        elif command == "explain":
+            say(BELIEF_SEMANTICS)
+            say("Each current Support judgment contributes a binary 1 and each Oppose judgment a binary 0, with one declared count unit per clinician. Native PLN Revision combines these observations. Strength = Support / (Support + Oppose); review-count confidence = N/(N+1), where N = Support + Oppose. Uncertain judgments are recorded without a binary premise. Changing or withdrawing your review replaces or removes its contribution.")
+            say("The ranking uses 100*strength and displays review-count confidence separately. Source citations are preserved for inspection; they do not decide how many clinicians count. Review volume does not establish independent expertise, scientific certainty or treatment effectiveness. Reasons remain shared notes.")
+        elif command == "import":
+            if len(args) != 1:
+                raise ValueError('Use import "FILE.json".')
+            path = Path(args[0]).expanduser().resolve()
+            imported = self.import_handoff(path)
+            say(f"Loaded {imported['total']} entries; {imported['new']} new; {imported['changed']} source versions changed.")
+            if imported["learned"]:
+                say(f"Approved knowledge reused in {imported['learned']} entry/entries. Use learning N to inspect what changed and why.")
+            if imported["changed"]:
+                say("Changed evidence requires new reviews. Earlier responses remain in history.")
+            self.listing()
+        elif command == "export":
+            if len(args) != 1:
+                raise ValueError('Use export "NEW-FILE.json".')
+            self.store.export(Path(args[0]))
+            say("Export saved: " + str(Path(args[0]).expanduser().resolve()))
+        elif command == "corrections":
+            rows = self.store.pending_corrections()
+            if not rows:
+                say("No pending corrections.")
+            for row in rows:
+                stale = " [older evidence version]" if row["base_version"] != row["current_version"] else ""
+                say(f"#{row['id']} {row['name']} / {row['condition']} — {row['field']} by {row['proposer']}{stale}")
+                say("Scope: " + ("reusable evidence correction; applies to matching future handoffs" if row["reusable"] else "local to this patient/condition entry"), 2)
+                say("Proposed: " + row["replacement"], 2)
+                say("Reason: " + row["rationale"], 2)
+                if row["citation"]:
+                    say("Reference: " + row["citation"], 2)
+                if row['field']=='review_claim':self.claim_proposal(row)
+        elif command in ("accept", "reject"):
+            if not args or not args[0].isdigit():
+                raise ValueError("Give a correction ID from corrections.")
+            correction = self.store.db.execute("SELECT * FROM corrections WHERE id=?", (int(args[0]),)).fetchone()
+            if correction:
+                self.store.require_active_candidate(correction["candidate_id"])
+                self.require_access(self.store.candidate(correction["candidate_id"])["patient_id"])
+                say(f"Correction #{correction['id']} proposed by {correction['proposer']}: {correction['field']}")
+                if correction['field']=='review_claim':
+                    self.claim_proposal(dict(correction))
+                    grounding=json.loads(correction['grounding_json'] or '{}')
+                    if grounding.get('source'):
+                        self.claim_source_context(grounding['source'])
+                        print_source_findings(grounding['source'])
+                    say('Approval confirms shared wording and source scope; the new claim starts unreviewed. Earlier wording and responses stay in history.')
+                else:
+                    say("Replacement: " + correction["replacement"], 2)
+                    say("Reason: " + correction["rationale"], 2)
+                    if correction["citation"]:
+                        say("Source: " + correction["citation"], 2)
+                if correction["reusable"]:
+                    say("Approving this teaches a reusable evidence statement for the same intervention, condition and source snapshot. It must contain no patient-specific observations.")
+            reason = " ".join(args[1:]) if len(args) > 1 else input("Reason for this decision: ").strip()
+            result = self.store.resolve_correction(int(args[0]), self.reviewer, command == "accept", reason)
+            say("Correction " + ("accepted." if result["accepted"] else "rejected."))
+            if result["accepted"]:
+                say("A new local evidence version was created. Previous reviews remain in history; the corrected assessment needs fresh review.")
+                if result["knowledge_id"]:
+                    say(f"Learned knowledge #{result['knowledge_id']} saved. Matching later handoffs will reuse it automatically. Use learning N to see its source and approval.")
+                print_assessment(self.store.belief_assessment(result["candidate"]))
+                self.ranking(result["candidate"]["condition"],compact=True)
+        elif command == "unlearn":
+            if not args or not args[0].isdigit():
+                raise ValueError('Use unlearn ID "reason" with an ID from learning N.')
+            identity = int(args[0])
+            if not any(fact["id"] == identity for c in self.store.candidates() for fact in self.store.learning_details(c)):
+                raise ValueError("This knowledge does not belong to the opened handoff.")
+            reason = " ".join(args[1:]) if len(args) > 1 else input("Reason to stop reuse: ").strip()
+            count = self.store.retire_knowledge(identity, self.reviewer, reason)
+            say(f"Knowledge #{identity} retired; {count} learned assessment(s) updated. History is retained; explicit local corrections are preserved.")
+        elif command in ("show", "details", "review", "reviews", "reason", "history", "trace", "withdraw", "correct", "teach", "learning", "assess", "evidence", "restore-evidence", "source-text", "correct-source", "claim", "claims"):
+            if not args:
+                raise ValueError("Give an intervention number from list.")
+            candidate = self.store.resolve(args[0])
+            if command == 'claim':
+                self.propose_claim(candidate,args[1:])
+            elif command == 'claims':
+                self.claims(candidate)
+            elif command == "assess":
+                if args[1:] not in ([],['--retry']):raise ValueError('Use assess N or assess N --retry.')
+                self.analyze_sources(candidate,retry=args[1:]==['--retry'])
+            elif command == "evidence":
+                self.evidence(candidate)
+            elif command == "source-text":
+                if len(args)!=2:raise ValueError('Use source-text N PMID:ID.')
+                source=next((r['source'] for r in self.store.source_records(candidate) if r['source']['id']==args[1]),None)
+                if source is None:source=self.store.saved_claim_source(candidate,args[1])
+                if source is None:raise ValueError('Choose a saved source from evidence N or claim N.')
+                say(source['text']);say('SHA-256: '+source['text_sha256'])
+            elif command == "correct-source":
+                source_id=args[1] if len(args)>1 else input('Source ID from evidence N (PMID:...): ').strip()
+                field=args[2] if len(args)>2 else input('Fact to correct (e.g. condition_match, comparison, effect.direction): ').strip()
+                value=args[3] if len(args)>3 else input('Corrected value: ').strip()
+                reason=args[4] if len(args)>4 else input('Reason: ').strip()
+                quote=args[5] if len(args)>5 else input('Exact supporting quote from source-text N PMID:ID: ').strip()
+                if len(args)>6:raise ValueError('Use correct-source N PMID:ID FIELD "value" "reason" "exact quote".')
+                head=self.store.evidence_digest(self.store.source_records(candidate))
+                records=self.store.edited_source_plan(candidate,source_id,field,value,quote)
+                print_assessment(score_sources(records))
+                if input('Confirm this source correction and recalculation? [y/N]: ').strip().casefold()!='y':
+                    say('Source facts unchanged.');return True
+                update=self.store.correct_source(candidate,self.reviewer,source_id,field,value,reason,quote,expected_digest=head)
+                say('Before: '+score_text(update['before']));say('After: '+score_text(update['after']))
+                self.ranking(candidate['condition'],compact=True)
+            elif command == "restore-evidence":
+                if len(args)<3 or not args[1].isdigit():raise ValueError('Use restore-evidence N EVENT "reason".')
+                update=self.store.restore_source_event(candidate,self.reviewer,int(args[1])," ".join(args[2:]))
+                say('Before: '+score_text(update['before']));say('After: '+score_text(update['after']))
+            elif command == "show":
+                self.show(candidate)
+            elif command == "learning":
+                self.learning(candidate)
+            elif command == "reason":
+                self.reason(candidate)
+            elif command == "details":
+                self.details(candidate)
+            elif command == "reviews":
+                print_assessment(self.store.belief_assessment(candidate))
+                self.reviews(candidate)
+            elif command == "review":
+                self.review(candidate, args[1:])
+            elif command == "history":
+                history = self.store.history(candidate)
+                current_ids = {r["id"] for r in self.store.current_reviews(candidate)}
+                say('Claim wording versions:')
+                for version in self.store.claim_history(candidate):
+                    state='current' if version['id']==candidate['current_version'] else 'historical'
+                    say(version['id'][:12]+' ['+state+'] — '+version['origin'])
+                    say(version['statement'],2)
+                say("Review events:")
+                for row in history["reviews"]:
+                    state = "current" if row["id"] in current_ids else "historical / withdrawn / superseded"
+                    if row["clinician_id"] is None:
+                        state = "legacy name-only; unverified and excluded"
+                    say(f"#{row['id']} {row['reviewer']}: {row['decision']} [{state}] | {row['created_at']}")
+                    if row["clinician_id"]:
+                        say("Clinician account ID: " + row["clinician_id"], 2)
+                    say(('Note: '+row['rationale']) if row['rationale'] else 'No note supplied.', 2)
+                say("Source-evidence versions:")
+                for event in self.store.evidence_events(candidate):
+                    say(f"Source event #{event['id']} [{event['version_id'][:12]}] by {event['reviewer']} — {event['trigger']}")
+                say("PLN appraisal versions:")
+                for row in history["belief_assessments"]:
+                    say(f"#{row['assessment_id']} [{row['version_id'][:12]}] {score_text(row)} — {row['trigger']}")
+                say("Legacy reviewer-agreement versions (history only):")
+                for row in history["assessments"]:
+                    say(f"#{row['assessment_id']} [{row['version_id'][:12]}] {score_text(row)} — {row['trigger']}")
+                for row in history["corrections"]:
+                    say(f"Correction #{row['id']}: {row['field']} — {row['status']} by {row['proposer']}")
+                    if row["resolver"]:
+                        say("Decision by " + row["resolver"] + ": " + row["resolution_reason"], 2)
+                if history["learned_knowledge"]:
+                    self.learning(candidate)
+            elif command == "trace":
+                assessment = self.store.belief_assessment(candidate)
+                native = assessment.get("native") if assessment else None
+                if not native:
+                    say("No decisive appraisal calculation yet. Use review N; uncertain judgments remain visible without an invented strength.")
+                else:
+                    say(native["engine"])
+                    say("Rule SHA-256: " + native["rule_sha256"])
+                    say("Adapter: " + assessment["adapter"])
+                    print(native["program"], end="")
+                    print(native["stdout"], end="")
+                    for group in assessment["groups"]:
+                        say("Grounds: "+", ".join(group["roots"])+" | review IDs: "+", ".join(map(str,group["review_ids"])))
+                    say("The saved trace contains one binary input per current decisive clinician judgment. References are displayed separately and do not determine weight.")
+            elif command == "withdraw":
+                reason = " ".join(args[1:]) if len(args) > 1 else input("Reason for withdrawal: ").strip()
+                update = self.store.review(candidate["id"], candidate["current_version"], self.reviewer, "withdrawn", reason)
+                update = dict(update, before=update['belief_before'], after=update['belief_after'])
+                say("Your appraisal was withdrawn and beliefs rebuilt. Confirmed source facts remain. Before: " + score_text(update["before"]))
+                print_assessment(update["after"])
+                self.ranking(candidate["condition"],compact=True)
+            elif command in ("correct", "teach"):
+                reusable = command == "teach"
+                if reusable:
+                    say("Teach a general, source-cited evidence correction for reuse. Keep patient observations and treatment eligibility in local reviews/corrections.")
+                fields = "why, note" if reusable else "why, note, warning, evidence, evidence_tier"
+                field = args[1] if len(args) > 1 else input("Field to correct (" + fields + "): ").strip()
+                replacement = args[2] if len(args) > 2 else input("Replacement text: ").strip()
+                reason = args[3] if len(args) > 3 else input("Reason: ").strip()
+                citation = args[4] if len(args) > 4 else ("" if len(args) > 1 else input("Public source reference (required): " if reusable else "Source/reference (optional): ").strip())
+                if len(args) > 5:
+                    raise ValueError('Use ' + command + ' N FIELD "replacement" "reason" "citation".')
+                correction = self.store.propose_correction(candidate["id"], candidate["current_version"], self.reviewer,
+                                                           field, replacement, reason, citation, reusable=reusable)
+                say(f"Correction #{correction} proposed. It has not changed the supplied assessment or score.")
+                say("Another reviewer can inspect corrections, then accept or reject it.")
+        else:
+            raise ValueError("Unknown command. Use help.")
+        return True
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, help="Import an intervention JSON before opening the CLI")
+    parser.add_argument("--advanced", action="store_true", help="Open the optional technical command interface instead of the guided review menu")
+    parser.add_argument("--db", type=Path, help="Review database; ALIS and local accounts use separate defaults")
+    parser.add_argument("--auth", choices=("alis", "local"), default="alis", help="ALIS clinician login (default), or separate local test accounts")
+    parser.add_argument("--access", choices=("file", "patient"), default="file",
+                        help="Review an explicitly supplied file (default), or require live ALIS patient access")
+    parser.add_argument("--signup", "--register", dest="register", action="store_true", help="Create another clinician using the existing signup flow")
+    parser.add_argument("--api-url", default=configured_api(ROOT), help="ALIS API URL; defaults to ALIS_API_URL or localhost:5001")
+    parser.add_argument("--no-start-backend", action="store_true", help="Check ALIS availability without resuming the installed local backend")
+    parser.add_argument("--omega", choices=("on","off"), default="on", help="Enable models only for optional --advanced source inspection; reviews never call a model")
+    parser.add_argument("--omega-container", default=None, help="Native Omega container; defaults to OMEGA_FEEDBACK_CONTAINER or chatbot-alis-omega-mapping-1")
+    parser.add_argument("--omega-timeout", type=int, default=90, help="One model request deadline in seconds; no automatic retry")
+    parser.add_argument("--omega-output-tokens", type=int, default=4096, help="Maximum output tokens for one interpretation")
+    args = parser.parse_args(argv)
+    if args.access == "patient" and args.auth != "alis":
+        parser.error("--access patient requires --auth alis; local accounts cannot verify ALIS patient permissions")
+    store = None
+    try:
+        if args.auth == "alis":
+            ensure_alis_ready(args.api_url, auto_start=not args.no_start_backend)
+        database = args.db or ROOT / ".local/feedback" / ("reviews.sqlite3" if args.auth == "alis" else "local-reviews.sqlite3")
+        store = FeedbackStore(database)
+        authentication = interactive_login(store, args.auth, args.api_url, create_account=args.register)
+        session = Session(store, authentication, args.auth, args.api_url, auto_start=not args.no_start_backend,
+                          access_mode=args.access, omega=OmegaReviewClient(args.omega_container,args.omega_timeout,args.omega_output_tokens) if args.advanced and args.omega=="on" else None)
+        handoff_notice = None
+        imported_and_authorised = False
+        if args.input:
+            try:
+                imported = session.import_handoff(args.input)
+            except AuthenticationError as error:
+                handoff_notice = "Login succeeded; the file was not imported. " + str(error)
+            else:
+                imported_and_authorised = True
+                say(f"Loaded {imported['total']} intervention entries; {imported['new']} new; {imported['changed']} changed source versions.")
+                if imported["learned"]:
+                    say(f"Approved knowledge reused in {imported['learned']} entry/entries. Use learning N for the source and approval trace.")
+        if not args.advanced:
+            say('ALIS — Clinician review')
+            say('Research support, not medical advice.')
+            say('Signed in: '+session.reviewer.name)
+            if handoff_notice:say(handoff_notice)
+            GuidedFeedback(session,lambda value='':print(value,flush=True),args.input if imported_and_authorised else None).run()
+            return 0
+        say("ALIS — Clinician feedback CLI")
+        say("Research support, not medical advice.")
+        say("Reviews use your selected judgment. Optional reasons are shared notes; no reason interpretation or model call.")
+        say("Explicit source inspection with assess N is available separately." if args.omega=="on" else "Model access is disabled.")
+        session.whoami()
+        say("Database: " + str(store.path))
+        if args.access == "file":
+            say("Review source: supplied JSON file. Opening the file records review access for your clinician ID; no ALIS patient record is fetched.")
+        else:
+            say("Review source: patient-linked handoff. ALIS patient permissions are checked before access.")
+        say("Review statement: retain an intervention as a research candidate for its stated condition.")
+        if store.belief_policy_migrated:
+            say("Review-count policy enabled: current appraisals were recalculated from each clinician's latest judgment. Previous score versions, reviews and source facts are preserved in history.")
+        say("The handoff starts unreviewed. Review N revises clinician support and review-count confidence. Each clinician has one current judgment; source labels and notes add no numerical weight.")
+        dataset = store.db.execute("SELECT value FROM settings WHERE key='dataset'").fetchone()
+        if dataset:
+            try:
+                if not imported_and_authorised:
+                    session.require_access()
+                session.listing()
+            except AuthenticationError as error:
+                say("Signed in. " + str(error))
+        else:
+            say('No handoff imported yet. Use import "FILE.json".')
+        if handoff_notice:
+            say(handoff_notice)
+        say("Use help for commands. Current clinician: " + session.reviewer.name)
+        while True:
+            try:
+                line = input("feedback> ")
+            except EOFError:
+                print()
+                break
+            try:
+                if not session.command(line):
+                    break
+            except (ValueError, OSError, sqlite3.Error, NativePLNError, AuthenticationError, OmegaReviewError) as error:
+                say("Cannot complete that request: " + str(error))
+        return 0
+    except (ValueError, OSError, sqlite3.Error, NativePLNError, AuthenticationError) as error:
+        say("Cannot start: " + str(error))
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("\nSession closed. Committed reviews are preserved.")
+        return 0
+    finally:
+        if store:
+            store.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,21 @@
+{
+  "schema": "alis-feedback-native-v1",
+  "omega_repository": "https://github.com/singnet/Omega.git",
+  "omega_commit": "b78c774061f559e62b5b4a2a40e39c89cd1aa403",
+  "petta_repository": "https://github.com/trueagi-io/PeTTa.git",
+  "petta_commit": "43705f5d9ff8958ffe7f0aa6777fb8477f2401f2",
+  "files": {
+    "vendor/PeTTa/src/ext_points.pl": "0b5f1b115e29892ab1bf5833c022df4c2f3f1558cb04f57a8f52de5ccdad8436",
+    "vendor/PeTTa/src/filereader.pl": "b8941ea91e7e85ff389630372607b04541773e3055816c51be4dd6eb265c0c5d",
+    "vendor/PeTTa/src/main.pl": "80d9cd8d68c9ed6b5646587b42ad8d55080e6d2c9a1c973f827dd4bcc6833678",
+    "vendor/PeTTa/src/metta.pl": "11285f8180b0af7fbb9ec98ab1a369826607c57ca2735213d052abefe2b4f6ad",
+    "vendor/PeTTa/src/parser.pl": "5abc89c3e8ddd58769a4995919cd18d72d5b86224d6ed58363f25450e32cf45d",
+    "vendor/PeTTa/src/spaces.pl": "907d362c72bcfe82c03b44e14b1632449b327fa3c0dcdb5743051e827f7c9557",
+    "vendor/PeTTa/src/specializer.pl": "fb39a38acc69653ea2c39e15965116dfa039d05cfacf8514b4444dc7d26cedbf",
+    "vendor/PeTTa/src/translator.pl": "628b0de73489bc1518a255bb061929b2fe5183ff28318fa495802228bd290a63",
+    "vendor/PeTTa/LICENSE": "451e08f082f06f100facd2ef99f3c661155a7a433af091889d4c04e264838ce5",
+    "vendor/Omega/LICENSE": "66c21d9bc47c8f2615f6cb73a51070f32818f8e34404215bdb544d92b8ba8c5b",
+    "vendor/Omega/lib_pln.metta": "05b63266ad79c3cd0b32a83a4596ad47923e612e746303628da7500bbcffa7ae"
+  },
+  "scope": "Unmodified native Omega PLN rules and minimal PeTTa Prolog source. No integration-project application code."
+}

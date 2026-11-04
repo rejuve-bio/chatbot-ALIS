@@ -3,3 +3,6 @@ venv/
 *.txt
 __pycache__/
 datas
+.local/
+.venv*/
+.pytest_cache/
