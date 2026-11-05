@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clinician judgments, shared review notes and native PLN appraisal ranking."""
+"""Review intervention evidence and share clinician assessments."""
 from __future__ import annotations
 
 import argparse
@@ -920,9 +920,13 @@ def main(argv=None) -> int:
                 handoff_notice = "Login succeeded; the file was not imported. " + str(error)
             else:
                 imported_and_authorised = True
-                say(f"Loaded {imported['total']} intervention entries; {imported['new']} new; {imported['changed']} changed source versions.")
+                if args.advanced:
+                    say(f"Loaded {imported['total']} intervention entries; {imported['new']} new; {imported['changed']} changed source versions.")
+                else:
+                    say(f"Opened {imported['total']} interventions.")
                 if imported["learned"]:
-                    say(f"Approved knowledge reused in {imported['learned']} entry/entries. Use learning N for the source and approval trace.")
+                    say(f"Approved knowledge reused in {imported['learned']} entry/entries. Use learning N for the source and approval trace." if args.advanced else
+                        f"Applied approved corrections to {imported['learned']} entries.")
         if not args.advanced:
             say('ALIS — Clinician review')
             say('Research support, not medical advice.')
@@ -970,10 +974,11 @@ def main(argv=None) -> int:
                 say("Cannot complete that request: " + str(error))
         return 0
     except (ValueError, OSError, sqlite3.Error, NativePLNError, AuthenticationError) as error:
-        say("Cannot start: " + str(error))
+        from app.services.feedback_menu import review_message
+        say("Cannot start: " + (str(error) if args.advanced else review_message(error)))
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("\nSession closed. Committed reviews are preserved.")
+        print("\nSession closed. Saved reviews are preserved.")
         return 0
     finally:
         if store:

@@ -23,6 +23,18 @@ from app.services.feedback_terminal import Terminal, clip, confidence as compact
 ERRORS=(ValueError,OSError,sqlite3.Error,AuthenticationError,NativePLNError,AtlasError,OmegaReviewError)
 
 
+def review_message(error):
+    if isinstance(error,NativePLNError):
+        return 'Your review could not be saved because scores could not be updated. Please try again.'
+    if isinstance(error,AtlasError):
+        return 'The atlas could not be updated. Your saved reviews are available; choose r to try again.'
+    if isinstance(error,OmegaReviewError):
+        return 'Omega could not prepare the explanation. Please try again later.'
+    if isinstance(error,sqlite3.Error):
+        return 'Saved reviews are temporarily unavailable. Please reopen the application.'
+    return str(error)
+
+
 def confidence_text(value):
     if value is None:return 'unknown'
     text=f'{value:.6f}'
@@ -47,7 +59,7 @@ class GuidedFeedback:
         try:
             result=self.atlas.refresh(self.min_decisive,progress=lambda message:self.ui.text('Updating reviewed atlas…',kind='muted'))
         except AtlasError as error:
-            self.atlas_error=str(error)
+            self.atlas_error='Choose r to try updating the atlas again.'
             return None
         self.atlas_error=None
         if announce:
@@ -146,10 +158,7 @@ class GuidedFeedback:
         else:self.say('Starting atlas. Later versions retain the changes caused by reviews.',kind='muted')
         if result['changes']:self.atlas_changes(result)
         else:self.say('No changes to strength, status or ordering.')
-        self.ui.section('Execution')
-        self.say('Native Omega · local workflow · zero model calls',kind='muted')
-        self.say('Read feedback → apply review policy → assemble atlas',kind='muted')
-        self.ui.menu([('1','Change history'),('2','Export reviewed atlas JSON'),('3','Native PLN calculation'),('0','Back')])
+        self.ui.menu([('1','Change history'),('2','Export reviewed atlas'),('3','How scores work'),('0','Back')])
         choice=input('Atlas > ').strip()
         if choice=='1':
             self.s.require_access()
@@ -174,10 +183,12 @@ class GuidedFeedback:
             target=Path(answer).expanduser() if answer else default;target.parent.mkdir(parents=True,exist_ok=True)
             self.notice={'message':'Export saved: '+str(self.atlas.export(result,target))}
         elif choice=='3':
-            value=input('Intervention entry number: ').strip();self.s.require_access()
-            c=self.store.resolve(value);a=self.store.belief_assessment(c);native=(a or {}).get('native')
-            if native:self.ui.document('Native PLN · '+c['name'],native['program']+'\n'+native['stdout'],native['engine'])
-            else:self.ui.document('Native PLN','No decisive input for this version. Strength and confidence remain unknown.')
+            self.ui.document('How scores work',
+                'Strength is the share of Support among current Support and Oppose responses.\n\n'
+                'Count confidence reflects how many reviewers gave a decisive response: N / (N + 1). '
+                'It measures review volume, rather than certainty that a treatment works.\n\n'
+                'Uncertain responses remain visible separately. Each reviewer contributes one current response. '
+                'Changing your response replaces your previous contribution and preserves its history.')
 
     def filters(self):
         self.s.require_access();self.ui.begin('Filter interventions')
@@ -221,12 +232,12 @@ class GuidedFeedback:
                         'Uncertain: recorded separately, without positive or negative weight.\n'
                         'Reviews: decisive / total reviewers. These are research appraisals, not treatment certainty.\n\n'
                         'A new response replaces your current response for this evidence version. History is preserved.\n'
-                        'Use r for atlas changes, export and the native PLN calculation.\n'
+                        'Use r for atlas changes, export and an explanation of the scores.\n'
                         'Use n/p to change list pages. Entry IDs never change, and any ID can be opened from any page.');continue
                 if choice.isdigit():
                     self.s.require_access();self.notice=None;self.intervention(self.store.resolve(choice)['id']);continue
                 self.notice={'error':'Choose an intervention ID or a displayed menu key.'}
-            except ERRORS as error:self.notice={'error':str(error)}
+            except ERRORS as error:self.notice={'error':review_message(error)}
 
     def open_file(self):
         value=input('Review JSON file path (Enter to cancel): ').strip().strip('"\'')
@@ -249,10 +260,10 @@ class GuidedFeedback:
         if source_id is None and candidate.get('claim_approved'):
             approved=(candidate['data'].get('review_claim_grounding') or {}).get('source')
             if approved and approved['id'] in ids:
-                self.say('Reading the study snapshot attached to the approved wording…')
+                self.say('Reading the study linked to the approved statement…')
                 return approved
         try:
-            self.say('Reading the linked study (no model call)…')
+            self.say('Reading the linked study…')
             source,_=self.store.claim_source(candidate,source_id or ids[0])
             return source
         except (ValueError,OSError) as error:
@@ -333,7 +344,7 @@ class GuidedFeedback:
                     old=source;source=self.more(c,source);redraw=(source is not old or self.notice is not None);continue
                 if choice=='5':self.record_concern(c,source);redraw=True;continue
                 self.ui.text('Choose 1, 2, 3, 4, 5 or 0.',kind='warning');redraw=False
-            except ERRORS as error:self.ui.text(str(error),kind='danger');redraw=False
+            except ERRORS as error:self.ui.text(review_message(error),kind='danger');redraw=False
 
     def submit(self,c,decision,source):
         note=input('Note for other reviewers (Enter to skip): ').strip()
@@ -389,27 +400,27 @@ class GuidedFeedback:
         sources=[source] if source else []
         request=assistant.context(c,sources)
         if not request['sources'] and not request['review_notes']:
-            self.say('No study text or substantive review notes are available to explain. No model call was made.');return
+            self.say('There is no study text or reviewer note available to explain.');return
         key=assistant.key(c,request)
         stored=assistant.cached(c,request)
         if stored is None:
             rejected=self.store.cached_analysis('brief-rejected:'+key,ttl=10**12)
             if rejected:
-                self.say('The previous request for this exact brief failed: '+rejected['result']['error'])
-                if input('Make one new model request to retry? [y/N]: ').strip().casefold()!='y':return
+                self.say('Omega could not prepare this explanation earlier.')
+                if input('Try preparing the explanation again? [y/N]: ').strip().casefold()!='y':return
             identity=assistant.client.identity()
             if not self.store.has_external_consent(self.s.reviewer,identity):
-                self.say('The optional brief uses '+identity['model']+' at '+identity['destination']+'.')
-                self.say('It receives the selected study, intervention/condition and a bounded sample of reviewer notes. Patient identifiers, account names/emails and credentials are excluded or redacted. It cannot change reviews, scores or ordering.')
-                if input('Allow the authorized file text to be sent for this optional brief? [y/N]: ').strip().casefold()!='y':
-                    self.say('No text was sent. Reviewing and scoring remain available.');return
+                self.say('Omega can send study excerpts and selected reviewer notes to '+identity['destination']+' to prepare this explanation.')
+                self.say('Names, contact details, patient identifiers and login credentials are removed.')
+                if input('Allow this information to be shared for the explanation? [y/N]: ').strip().casefold()!='y':
+                    self.say('You can continue reviewing the evidence.');return
                 self.store.record_external_consent(self.s.reviewer,identity)
-            self.say('Omega is preparing a read-only review brief. At most one model call; no automatic retries.')
-            try:stored=assistant.generate(c,sources,request,progress=self.say)
+            self.say('Omega is preparing the explanation…')
+            try:stored=assistant.generate(c,sources,request,progress=lambda message:self.say('Omega is still preparing the explanation…',kind='muted'))
             except OmegaReviewError as error:
                 self.store.save_analysis('brief-rejected:'+key,{'error':str(error)})
-                self.say('Optional brief unavailable: '+str(error))
-                self.say('Your reviews, PLN appraisal and atlas remain available and unchanged.');return
+                self.say('Omega could not prepare the explanation. Please try again later.')
+                self.say('Your reviews and atlas are saved.');return
         value=stored['result'];coverage=value['context']['coverage']
         lines=['Draft explanation for checking · source facts and scores are unchanged.','',
                str(coverage['sources_inspected'])+' linked abstract(s) · '+str(coverage['selected_notes'])+' selected notes / '+str(coverage['reviews_with_notes'])+' nonempty responses · '+str(coverage['current_reviews'])+' current reviewers.']
@@ -424,9 +435,8 @@ class GuidedFeedback:
                 lines.append('')
         lines+=['QUESTIONS TO RESOLVE']
         for item in brief['next_questions']:lines.append(item['question']+' ['+', '.join(item['reference_ids'])+']')
-        if value.get('omissions'):lines+=['','An item containing an unreported quantity was omitted. Original model output is preserved in the explanation cache.']
-        lines+=['','Native Omega · '+value['runtime']['model']+' · '+('0 new model calls · saved brief' if stored['cached'] else '1 model call')]
-        self.ui.document('Omega review brief','\n'.join(lines),c['name']+' · '+('Saved · no new model call' if stored['cached'] else 'New explanation'))
+        if value.get('omissions'):lines+=['','Some details were left out because the cited text did not support them.']
+        self.ui.document('Omega review brief','\n'.join(lines),c['name']+' · '+('Saved explanation' if stored['cached'] else 'New explanation'))
 
     def record_concern(self,c,source):
         current=next((r for r in self.store.current_reviews(c) if r['clinician_id']==self.s.reviewer.id),None)
@@ -456,7 +466,7 @@ class GuidedFeedback:
         self.store.review(c['id'],c['current_version'],self.s.reviewer,decision,current['rationale'] if current else '',
                           source['id'] if source else current['citation'] if current else '',notes_only=True,
                           submitted_decision=decision,concern_kind=kind,concern_text=text)
-        self.say('Saved against your clinician identity. This flags the entry for review; it does not rewrite the publication or turn the concern into an extra PLN vote.')
+        self.say('Concern saved. Other reviewers can see what needs checking.')
         self.refresh_atlas(announce=True)
 
     def wording(self,c,source,pending):

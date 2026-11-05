@@ -20,9 +20,10 @@ If a note changes without changing the appraisal, the screen says so. Other
 entries moving down because one moved up are summarized separately.
 
 The list on login is read from this reviewed atlas. **r Reviewed atlas / changes**
-shows its latest version, current reviewer provenance, the executed Omega tools,
-change history, an optional JSON export, and the actual native PLN program/output
-for an entry. Entry numbers remain fixed even when the research order changes.
+shows its latest version, reviewer history, changes, an atlas export and a plain
+explanation of the scores. Entry numbers remain fixed even when the research
+order changes. Runtime details and native calculations are available in the
+advanced interface.
 
 Changing your assessment, withdrawing it, reporting a concern or clearing your
 own concern all refresh the atlas. A later login loads the saved result. If
@@ -157,7 +158,7 @@ sections and a persistent before/after panel after saving. List pages adapt to
 the terminal height; **n/p** moves between pages. Any stable entry ID can be
 opened from any page. Your current response remains visible on the review card.
 
-Full abstracts, reviewer history, Omega briefs and native traces use a reader
+Full abstracts, reviewer history and Omega briefs use a reader
 with **Enter/n** for the next page, **p** for the previous page and **0** to return.
 The review choices and evidence/history menu keep their existing numbers.
 

@@ -87,8 +87,8 @@ The clinician CLI now closes the post-intervention feedback loop: saving a
 judgment revises its appraisal through native PLN, then native Omega tools
 assemble the next atlas using the current reviews, uncertainty and record
 concerns. The screen shows before/after values, research order, status and the
-responsible review IDs. **r** opens the saved atlas, change history, native trace
-and JSON export. The ordinary workflow makes zero model calls.
+responsible review IDs. **r** opens the saved atlas, change history, score
+explanations and export. Technical calculations remain in the advanced interface.
 
 See [the review workflow](docs/feedback-cli.md). This operates on the supplied
 intervention JSON and preserves the original evidence and review history.

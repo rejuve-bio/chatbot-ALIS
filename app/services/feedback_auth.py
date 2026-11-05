@@ -371,7 +371,7 @@ def interactive_login(store, provider: str, base: str, create_account: bool = Fa
     store.bind_auth(provider, api_url(base) if provider == "alis" else "local-feedback")
     from app.services.feedback_terminal import Terminal
     ui=Terminal()
-    ui.begin('Clinician login','ALIS · '+base if provider=='alis' else 'Local test accounts · '+store.path.name)
+    ui.begin('Clinician login','ALIS' if provider=='alis' else 'Local test accounts')
     ui.text('Passwords are hidden. Reviews stay associated with your account.',kind='muted')
     if provider == "local" and store.local_account_count() == 0:
         print("No local test account exists in this database yet.")
