@@ -3,3 +3,5 @@ venv/
 *.txt
 __pycache__/
 datas
+atlas_store/
+atlas_results/

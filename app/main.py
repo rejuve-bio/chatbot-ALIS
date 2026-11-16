@@ -1,7 +1,9 @@
 
 import logging
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 
 from app.routers import router
@@ -30,6 +32,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing biology-evidence collections (creates + populates only what's missing)...")
     init_biology_collections()
     logger.info("Biology-evidence collections ready")
+    from app.services.atlas_v2 import warm_treatment_cache
+    threading.Thread(target=warm_treatment_cache, name="atlas-warmup", daemon=True).start()
+    logger.info("Atlas treatment warm-up started in the background")
+    from app.services.atlas_precompute import precompute_loop
+    threading.Thread(target=precompute_loop, name="atlas-precompute", daemon=True).start()
+    logger.info("Atlas daily precompute started in the background")
     yield
     logger.info("Shutting down...")
 
@@ -41,6 +49,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
